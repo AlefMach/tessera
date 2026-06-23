@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -10,34 +11,49 @@ import (
 	"github.com/alef-mach/tessera/internal/memory"
 )
 
-const maxRunLLMCalls = 6
+const maxAgentSteps = 200
 
-func (o *Orchestrator) executeLLM(ctx context.Context, run *memory.Run, input string) {
+func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input string) error {
 	if o.llm == nil {
-		o.emit(ctx, event.New("error.occurred", "LLM unavailable", "No LLM provider is configured.", map[string]any{
-			"error": "llm provider is nil",
-		}))
-		return
+		return fmt.Errorf("LLM unavailable: no LLM provider is configured")
 	}
 
 	nextInput := input
-	for {
-		again := o.callLLMOnce(ctx, run, nextInput)
-		if !again {
-			return
+	for step := 1; step <= maxAgentSteps; step++ {
+		run.Steps = step
+		run.UpdatedAt = time.Now().UTC()
+		if err := o.memory.SaveRun(ctx, *run); err != nil {
+			return fmt.Errorf("save run step %d: %w", step, err)
 		}
-		if run != nil && run.Calls >= maxRunLLMCalls {
-			o.emit(ctx, event.New("run.aborted", "Run paused", "Tessera reached the per-task LLM call limit. Review the latest output and send another instruction to continue.", map[string]any{
-				"run_id":    run.ID,
-				"llm_calls": run.Calls,
-			}))
-			return
+
+		o.emit(ctx, event.New("agent.step.started", "Agent step started", "", map[string]any{
+			"run_id": run.ID,
+			"step":   step,
+		}))
+
+		action, err := o.requestModelAction(ctx, run, nextInput)
+		if err != nil {
+			return err
 		}
-		nextInput = input + "\n\nContinue from the latest saved observation. If the task is complete, respond with action \"answer\" and summarize the result."
+		result, done, err := o.executeModelAction(ctx, run, action)
+		if err != nil {
+			return err
+		}
+		o.emit(ctx, event.New("agent.step.finished", "Agent step finished", oneLine(result), map[string]any{
+			"run_id": run.ID,
+			"step":   step,
+			"action": string(action.Type),
+		}))
+		if done {
+			return nil
+		}
+
+		nextInput = input + "\n\n# Previous action result\n" + result + "\n\nChoose the next small action based on this result and the saved observations."
 	}
+	return fmt.Errorf("agent stopped after reaching the maximum of %d steps", maxAgentSteps)
 }
 
-func (o *Orchestrator) callLLMOnce(ctx context.Context, run *memory.Run, input string) bool {
+func (o *Orchestrator) requestModelAction(ctx context.Context, run *memory.Run, input string) (ModelAction, error) {
 	runID := ""
 	if run != nil {
 		runID = run.ID
@@ -67,7 +83,7 @@ func (o *Orchestrator) callLLMOnce(ctx context.Context, run *memory.Run, input s
 			"error":  err.Error(),
 			"run_id": runID,
 		}))
-		return false
+		return ModelAction{}, err
 	}
 
 	o.emit(ctx, event.New("llm.call.finished", "LLM response", strings.TrimSpace(resp.Text), map[string]any{
@@ -78,5 +94,16 @@ func (o *Orchestrator) callLLMOnce(ctx context.Context, run *memory.Run, input s
 		"duration":      resp.Duration.Truncate(time.Millisecond).String(),
 		"run_id":        runID,
 	}))
-	return o.handleModelResponse(ctx, run, resp.Text)
+	action, err := parseModelAction(resp.Text)
+	if err != nil {
+		o.saveObservation(ctx, run, "model.invalid_action", strings.TrimSpace(resp.Text), map[string]any{
+			"error": err.Error(),
+		})
+		return ModelAction{}, fmt.Errorf("invalid model action: %w", err)
+	}
+	o.saveObservation(ctx, run, "model."+string(action.Type), firstNonEmpty(action.Reason, action.Summary), map[string]any{
+		"action": string(action.Type),
+		"files":  action.Files,
+	})
+	return action, nil
 }

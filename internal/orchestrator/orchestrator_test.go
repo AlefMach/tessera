@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,8 +13,10 @@ import (
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/llm"
+	"github.com/alef-mach/tessera/internal/memory"
 	"github.com/alef-mach/tessera/internal/memory/sqlite"
 	"github.com/alef-mach/tessera/internal/port"
+	"github.com/alef-mach/tessera/internal/session"
 )
 
 func TestInteractiveInputCallsLLM(t *testing.T) {
@@ -21,7 +24,7 @@ func TestInteractiveInputCallsLLM(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resp: llm.GenerateResponse{
-			Text:         "resposta do modelo",
+			Text:         `{"type":"finish","summary":"resposta do modelo"}`,
 			Model:        "llama3.2",
 			InputTokens:  3,
 			OutputTokens: 4,
@@ -177,8 +180,8 @@ func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
-			{Text: `{"action":"run_command","message":"Run the focused Go tests.","command":{"name":"go","args":["test","./..."],"reason":"Verify the current project."}}`},
-			{Text: `{"action":"answer","message":"Tests passed. No code changes are needed."}`},
+			{Text: `{"type":"run","reason":"Run the focused Go tests.","command":"go test ./..."}`},
+			{Text: `{"type":"finish","summary":"Tests passed. No code changes are needed."}`},
 		},
 	}
 	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
@@ -233,8 +236,8 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	patch := "diff --git a/hello.txt b/hello.txt\nnew file mode 100644\nindex 0000000..ce01362\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hello\n"
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
-			{Text: `{"action":"propose_patch","message":"Create hello.txt.","files":["hello.txt"],"patch":` + strconv.Quote(patch) + `}`},
-			{Text: `{"action":"answer","message":"Patch applied."}`},
+			{Text: `{"type":"patch","reason":"Create hello.txt.","files":["hello.txt"],"patch":` + strconv.Quote(patch) + `}`},
+			{Text: `{"type":"finish","summary":"Patch applied."}`},
 		},
 	}
 	exec := &fakeExecutor{out: port.Output{Stdout: ""}}
@@ -263,6 +266,173 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	}
 	if len(model.requests) != 2 {
 		t.Fatalf("expected Tessera to continue after applying patch, got %d LLM calls", len(model.requests))
+	}
+}
+
+func TestBlockerActionFailsRun(t *testing.T) {
+	ctx := context.Background()
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{resp: llm.GenerateResponse{Text: `{"type":"blocker","reason":"missing required decision"}`}}
+	ui := &scriptedUI{lines: []string{"continue\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := store.ListRuns(ctx, model.requests[0].SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" {
+		t.Fatalf("expected failed run, got %#v", runs)
+	}
+	if !ui.sawEvent("run.failed") {
+		t.Fatalf("expected run.failed event, events=%#v", ui.events)
+	}
+}
+
+func TestAgentLoopStopsAtMaxSteps(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/limit\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{resp: llm.GenerateResponse{Text: `{"type":"inspect","reason":"Need more context.","files":["go.mod"]}`}}
+	ui := &scriptedUI{lines: []string{"loop\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(model.requests) != maxAgentSteps {
+		t.Fatalf("expected %d LLM calls, got %d", maxAgentSteps, len(model.requests))
+	}
+	runs, err := store.ListRuns(ctx, model.requests[0].SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" || runs[0].Steps != maxAgentSteps {
+		t.Fatalf("expected failed run at max steps, got %#v", runs)
+	}
+}
+
+func TestInvalidModelActionFailsRun(t *testing.T) {
+	ctx := context.Background()
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{resp: llm.GenerateResponse{Text: `{"type":"run"}`}}
+	ui := &scriptedUI{lines: []string{"invalid\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := store.ListRuns(ctx, model.requests[0].SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" {
+		t.Fatalf("expected invalid action to fail run, got %#v", runs)
+	}
+	if !ui.sawEvent("run.failed") {
+		t.Fatalf("expected run.failed event, events=%#v", ui.events)
+	}
+}
+
+func TestRunStepsUpdatedAcrossLoop(t *testing.T) {
+	ctx := context.Background()
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{resps: []llm.GenerateResponse{
+		{Text: `{"type":"run","reason":"Verify.","command":"go test ./..."}`},
+		{Text: `{"type":"finish","summary":"done"}`},
+	}}
+	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
+	ui := &scriptedUI{lines: []string{"steps\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, exec, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := store.ListRuns(ctx, model.requests[0].SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Steps != 2 || runs[0].Status != "finished" {
+		t.Fatalf("expected finished run with 2 steps, got %#v", runs)
+	}
+}
+
+func TestFailRunPersistsFailedStatusAndErrorObservation(t *testing.T) {
+	ctx := context.Background()
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	if err := store.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sess := session.Session{ID: "sess-test", CWD: t.TempDir(), Provider: "ollama", Model: "llama3.2", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := store.SaveSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	ui := &scriptedUI{}
+	orch := New(nil, store, ui, nil, config.Config{TesseraDir: t.TempDir()})
+	orch.session = sess
+	run := &memory.Run{ID: "run-test", SessionID: sess.ID, Input: "x", Status: "running", StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := store.SaveRun(ctx, *run); err != nil {
+		t.Fatal(err)
+	}
+
+	orch.failRun(ctx, run, errors.New("boom"))
+
+	got, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "failed" || got.EndedAt == nil {
+		t.Fatalf("expected failed run with ended_at, got %#v", got)
+	}
+	observations, err := store.ListObservations(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundError := false
+	for _, observation := range observations {
+		if observation.Kind == "error" && strings.Contains(observation.Content, "boom") {
+			foundError = true
+			break
+		}
+	}
+	if !foundError {
+		t.Fatalf("expected error observation, got %#v", observations)
+	}
+}
+
+func TestModelActionValidationRejectsIncompleteActions(t *testing.T) {
+	tests := []ModelAction{
+		{Type: ActionInspect},
+		{Type: ActionPatch},
+		{Type: ActionRun},
+		{Type: ActionFinish},
+		{Type: ActionBlocker},
+		{Type: ActionType("unknown")},
+	}
+	for _, tt := range tests {
+		if err := tt.Validate(); err == nil {
+			t.Fatalf("expected validation error for %#v", tt)
+		}
 	}
 }
 

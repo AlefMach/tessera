@@ -90,7 +90,13 @@ func (o *Orchestrator) interactive(ctx context.Context) error {
 			o.renderIndex(ctx)
 		default:
 			run := o.startRun(ctx, input)
-			o.executeLLM(ctx, run, input)
+			if run == nil {
+				continue
+			}
+			if err := o.runAgentLoop(ctx, run, input); err != nil {
+				o.failRun(ctx, run, err)
+				continue
+			}
 			o.finishRun(ctx, run)
 		}
 	}
@@ -103,7 +109,6 @@ func (o *Orchestrator) startRun(ctx context.Context, input string) *memory.Run {
 		SessionID: o.session.ID,
 		Input:     input,
 		Status:    "running",
-		Steps:     1,
 		StartedAt: now,
 		UpdatedAt: now,
 	}
@@ -145,6 +150,31 @@ func (o *Orchestrator) finishRun(ctx context.Context, run *memory.Run) {
 	if err := o.memory.SaveRun(ctx, *run); err != nil {
 		o.emit(ctx, event.New("error.occurred", "Run not saved", err.Error(), map[string]any{"error": err.Error()}))
 	}
+	o.activeRun = nil
+}
+
+func (o *Orchestrator) failRun(ctx context.Context, run *memory.Run, err error) {
+	if run == nil {
+		return
+	}
+	message := "run failed"
+	if err != nil {
+		message = err.Error()
+	}
+	now := time.Now().UTC()
+	run.Status = "failed"
+	run.UpdatedAt = now
+	run.EndedAt = &now
+	o.saveObservation(ctx, run, "error", message, map[string]any{
+		"error": message,
+	})
+	if saveErr := o.memory.SaveRun(ctx, *run); saveErr != nil {
+		o.emit(ctx, event.New("error.occurred", "Run not saved", saveErr.Error(), map[string]any{"error": saveErr.Error(), "run_id": run.ID}))
+	}
+	o.emit(ctx, event.New("run.failed", "Run failed", message, map[string]any{
+		"run_id": run.ID,
+		"error":  message,
+	}))
 	o.activeRun = nil
 }
 

@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,115 +15,206 @@ import (
 	"github.com/alef-mach/tessera/internal/port"
 )
 
-type modelAction struct {
-	Action  string        `json:"action"`
-	Message string        `json:"message"`
-	Command commandAction `json:"command"`
-	Patch   string        `json:"patch"`
-	Files   []string      `json:"files"`
+const maxInspectFileBytes = 24_000
+
+type ActionType string
+
+const (
+	ActionInspect ActionType = "inspect"
+	ActionPatch   ActionType = "patch"
+	ActionRun     ActionType = "run"
+	ActionFinish  ActionType = "finish"
+	ActionBlocker ActionType = "blocker"
+)
+
+type ModelAction struct {
+	Type    ActionType `json:"type"`
+	Reason  string     `json:"reason,omitempty"`
+	Files   []string   `json:"files,omitempty"`
+	Patch   string     `json:"patch,omitempty"`
+	Command string     `json:"command,omitempty"`
+	Summary string     `json:"summary,omitempty"`
 }
 
-type commandAction struct {
-	Name   string   `json:"name"`
-	Args   []string `json:"args"`
-	Reason string   `json:"reason"`
-}
-
-func (a *modelAction) UnmarshalJSON(data []byte) error {
-	type actionAlias struct {
-		Action  string          `json:"action"`
-		Message string          `json:"message"`
-		Command commandAction   `json:"command"`
-		Patch   string          `json:"patch"`
-		Files   json.RawMessage `json:"files"`
-	}
-	var raw actionAlias
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	a.Action = raw.Action
-	a.Message = raw.Message
-	a.Command = raw.Command
-	a.Patch = raw.Patch
-	a.Files = parseStringList(raw.Files)
-	return nil
-}
-
-func (c *commandAction) UnmarshalJSON(data []byte) error {
-	type commandAlias struct {
-		Name   string          `json:"name"`
-		Args   json.RawMessage `json:"args"`
-		Reason string          `json:"reason"`
-	}
-	var raw commandAlias
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	c.Name = raw.Name
-	c.Args = parseStringList(raw.Args)
-	c.Reason = raw.Reason
-	return nil
-}
-
-func (o *Orchestrator) handleModelResponse(ctx context.Context, run *memory.Run, text string) bool {
-	action, ok := parseModelAction(text)
-	if !ok {
-		o.saveObservation(ctx, run, "model.answer", strings.TrimSpace(text), nil)
-		return false
-	}
-	if action.Message != "" {
-		o.saveObservation(ctx, run, "model."+firstNonEmpty(action.Action, "answer"), action.Message, nil)
-	}
-
-	switch action.Action {
-	case "", "answer":
-		return false
-	case "run_command":
-		return o.handleRunCommand(ctx, run, action)
-	case "propose_patch":
-		return o.handleProposedPatch(ctx, run, action)
-	case "suggest_commit_message":
-		o.emit(ctx, event.New("commit.message.suggested", "Suggested commit message", action.Message, map[string]any{
-			"run_id": runID(run),
-		}))
-		return false
+func (a ModelAction) Validate() error {
+	switch a.Type {
+	case ActionInspect:
+		if len(a.Files) == 0 {
+			return errors.New("inspect action requires at least one file")
+		}
+	case ActionPatch:
+		if strings.TrimSpace(a.Patch) == "" {
+			return errors.New("patch action requires a non-empty patch")
+		}
+	case ActionRun:
+		if strings.TrimSpace(a.Command) == "" {
+			return errors.New("run action requires a non-empty command")
+		}
+	case ActionFinish:
+		if strings.TrimSpace(a.Summary) == "" {
+			return errors.New("finish action requires a non-empty summary")
+		}
+	case ActionBlocker:
+		if strings.TrimSpace(a.Reason) == "" {
+			return errors.New("blocker action requires a non-empty reason")
+		}
 	default:
-		o.emit(ctx, event.New("run.aborted", "Unsupported model action", action.Message, map[string]any{
-			"action": action.Action,
+		return fmt.Errorf("unknown action type %q", a.Type)
+	}
+	return nil
+}
+
+func (o *Orchestrator) executeModelAction(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
+	if err := action.Validate(); err != nil {
+		return "", false, err
+	}
+
+	switch action.Type {
+	case ActionInspect:
+		return o.executeInspect(ctx, run, action)
+	case ActionPatch:
+		return o.executePatch(ctx, run, action)
+	case ActionRun:
+		return o.executeRun(ctx, run, action)
+	case ActionFinish:
+		o.emit(ctx, event.New("run.completed", "Run completed", action.Summary, map[string]any{
 			"run_id": runID(run),
 		}))
-		return false
+		o.saveObservation(ctx, run, "finish", action.Summary, nil)
+		return action.Summary, true, nil
+	case ActionBlocker:
+		return "", false, fmt.Errorf("model reported blocker: %s", action.Reason)
+	default:
+		return "", false, fmt.Errorf("unknown action type %q", action.Type)
 	}
 }
 
-func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, action modelAction) bool {
+func (o *Orchestrator) executeInspect(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
+	var b strings.Builder
+	for _, file := range action.Files {
+		rel := filepath.ToSlash(strings.TrimSpace(file))
+		if rel == "" {
+			continue
+		}
+		content, err := o.readWorkspaceFile(rel)
+		if err != nil {
+			fmt.Fprintf(&b, "## %s\nerror: %s\n\n", rel, err)
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n%s\n\n", rel, content)
+	}
+	result := strings.TrimSpace(b.String())
+	if result == "" {
+		return "", false, errors.New("inspect action did not read any files")
+	}
+	o.emit(ctx, event.New("inspect.finished", "Inspection finished", action.Reason, map[string]any{
+		"files":  action.Files,
+		"run_id": runID(run),
+	}))
+	o.saveObservation(ctx, run, "inspect.result", result, map[string]any{
+		"files": action.Files,
+	})
+	return result, false, nil
+}
+
+func (o *Orchestrator) readWorkspaceFile(rel string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(rel))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path outside workspace is not allowed: %s", rel)
+	}
+	path := filepath.Join(o.session.CWD, clean)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	content := string(data)
+	if len(content) > maxInspectFileBytes {
+		content = content[:maxInspectFileBytes] + "\n... file truncated ..."
+	}
+	return content, nil
+}
+
+func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
+	o.emit(ctx, event.New("patch.proposed", "Patch proposed", action.Reason, map[string]any{
+		"files":  action.Files,
+		"patch":  action.Patch,
+		"run_id": runID(run),
+	}))
+	o.saveObservation(ctx, run, "patch.proposed", action.Reason, map[string]any{
+		"files": action.Files,
+		"patch": action.Patch,
+	})
 	if o.executor == nil {
-		o.emit(ctx, event.New("error.occurred", "Command unavailable", "No command executor is configured.", map[string]any{"run_id": runID(run)}))
-		return false
-	}
-	name := strings.TrimSpace(action.Command.Name)
-	args := cleanArgs(action.Command.Args)
-	if name == "" {
-		o.emit(ctx, event.New("run.aborted", "Command rejected", "The model did not provide a command name.", map[string]any{"run_id": runID(run)}))
-		return false
-	}
-	if reason := commandRisk(name, args); reason != "" {
-		o.emit(ctx, event.New("run.aborted", "Command blocked", reason, map[string]any{
-			"command": commandString(name, args),
-			"run_id":  runID(run),
-		}))
-		return false
+		return "", false, errors.New("patch unavailable: no command executor is configured")
 	}
 
-	commandText := commandString(name, args)
-	approved := o.ui.AskApproval(event.New("approval.requested", "Approve command?", action.Command.Reason, map[string]any{
+	approved := o.ui.AskApproval(event.New("approval.requested", "Apply patch?", action.Reason, map[string]any{
+		"files":  action.Files,
+		"patch":  action.Patch,
+		"risk":   "workspace file changes",
+		"run_id": runID(run),
+	}))
+	if !approved {
+		return "patch denied by user", false, errors.New("patch denied by user")
+	}
+
+	patchPath, err := o.writePatchFile(run, action.Patch)
+	if err != nil {
+		return "", false, fmt.Errorf("save patch: %w", err)
+	}
+	out, err := o.executor.Run(ctx, port.Command{
+		Name:    "git",
+		Args:    []string{"apply", "--whitespace=nowarn", patchPath},
+		Dir:     o.session.CWD,
+		Timeout: 30 * time.Second,
+	})
+	output := commandOutput(out, err)
+	if err != nil || out.ExitCode != 0 {
+		o.emit(ctx, event.New("run.aborted", "Patch failed", output, map[string]any{
+			"patch_file": patchPath,
+			"exit_code":  out.ExitCode,
+			"run_id":     runID(run),
+		}))
+		o.saveObservation(ctx, run, "patch.failed", output, map[string]any{
+			"patch_file": patchPath,
+			"exit_code":  out.ExitCode,
+		})
+		return output, false, nil
+	}
+
+	result := firstNonEmpty(output, "patch applied")
+	o.emit(ctx, event.New("patch.applied", "Patch applied", strings.TrimSpace(action.Reason), map[string]any{
+		"files":      action.Files,
+		"patch_file": patchPath,
+		"run_id":     runID(run),
+	}))
+	o.saveObservation(ctx, run, "patch.applied", result, map[string]any{
+		"files":      action.Files,
+		"patch_file": patchPath,
+	})
+	return result, false, nil
+}
+
+func (o *Orchestrator) executeRun(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
+	if o.executor == nil {
+		return "", false, errors.New("command unavailable: no command executor is configured")
+	}
+	commandText := strings.TrimSpace(action.Command)
+	name, args := splitCommand(commandText)
+	if name == "" {
+		return "", false, errors.New("run action provided an empty command")
+	}
+	if reason := commandRisk(commandText); reason != "" {
+		return "", false, fmt.Errorf("command blocked: %s", reason)
+	}
+
+	approved := o.ui.AskApproval(event.New("approval.requested", "Approve command?", action.Reason, map[string]any{
 		"command": commandText,
 		"risk":    "local command execution",
 		"run_id":  runID(run),
 	}))
 	if !approved {
-		o.emit(ctx, event.New("run.aborted", "Command denied", commandText, map[string]any{"run_id": runID(run)}))
-		return false
+		return "", false, errors.New("command denied by user")
 	}
 
 	started := time.Now()
@@ -135,10 +228,7 @@ func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, ac
 		Dir:     o.session.CWD,
 		Timeout: 2 * time.Minute,
 	})
-	output := strings.TrimSpace(strings.Join([]string{out.Stdout, out.Stderr}, "\n"))
-	if len(output) > 12000 {
-		output = output[:12000] + "\n... output truncated"
-	}
+	output := commandOutput(out, err)
 	status := "ok"
 	if err != nil || out.ExitCode != 0 {
 		status = "failed"
@@ -155,96 +245,29 @@ func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, ac
 		"status":    status,
 		"exit_code": out.ExitCode,
 	})
-	return true
+	return output, false, nil
 }
 
-func (o *Orchestrator) handleProposedPatch(ctx context.Context, run *memory.Run, action modelAction) bool {
-	o.emit(ctx, event.New("patch.proposed", "Patch proposed", action.Message, map[string]any{
-		"files":  action.Files,
-		"patch":  action.Patch,
-		"run_id": runID(run),
-	}))
-	o.saveObservation(ctx, run, "patch.proposed", action.Message, map[string]any{
-		"files": action.Files,
-		"patch": action.Patch,
-	})
-	if strings.TrimSpace(action.Patch) == "" {
-		o.emit(ctx, event.New("run.aborted", "Patch rejected", "The model did not provide a patch.", map[string]any{"run_id": runID(run)}))
-		return false
-	}
-	if o.executor == nil {
-		o.emit(ctx, event.New("error.occurred", "Patch unavailable", "No command executor is configured.", map[string]any{"run_id": runID(run)}))
-		return false
-	}
-
-	approved := o.ui.AskApproval(event.New("approval.requested", "Apply patch?", action.Message, map[string]any{
-		"files":  action.Files,
-		"patch":  action.Patch,
-		"risk":   "workspace file changes",
-		"run_id": runID(run),
-	}))
-	if !approved {
-		o.emit(ctx, event.New("run.aborted", "Patch denied", "No files were changed.", map[string]any{"run_id": runID(run)}))
-		return false
-	}
-
-	patchPath, err := o.writePatchFile(run, action.Patch)
-	if err != nil {
-		o.emit(ctx, event.New("error.occurred", "Patch not saved", err.Error(), map[string]any{"error": err.Error(), "run_id": runID(run)}))
-		return false
-	}
-	out, err := o.executor.Run(ctx, port.Command{
-		Name:    "git",
-		Args:    []string{"apply", "--whitespace=nowarn", patchPath},
-		Dir:     o.session.CWD,
-		Timeout: 30 * time.Second,
-	})
-	output := strings.TrimSpace(strings.Join([]string{out.Stdout, out.Stderr}, "\n"))
-	if err != nil || out.ExitCode != 0 {
-		if output == "" && err != nil {
-			output = err.Error()
-		}
-		o.emit(ctx, event.New("run.aborted", "Patch failed", output, map[string]any{
-			"patch_file": patchPath,
-			"exit_code":  out.ExitCode,
-			"run_id":     runID(run),
-		}))
-		o.saveObservation(ctx, run, "patch.failed", output, map[string]any{
-			"patch_file": patchPath,
-			"exit_code":  out.ExitCode,
-		})
-		return true
-	}
-
-	o.emit(ctx, event.New("patch.applied", "Patch applied", strings.TrimSpace(action.Message), map[string]any{
-		"files":      action.Files,
-		"patch_file": patchPath,
-		"run_id":     runID(run),
-	}))
-	o.saveObservation(ctx, run, "patch.applied", strings.TrimSpace(action.Message), map[string]any{
-		"files":      action.Files,
-		"patch_file": patchPath,
-	})
-	return true
-}
-
-func parseModelAction(text string) (modelAction, bool) {
+func parseModelAction(text string) (ModelAction, error) {
 	raw := strings.TrimSpace(text)
 	if raw == "" {
-		return modelAction{}, false
+		return ModelAction{}, errors.New("empty model response")
 	}
 	raw = extractJSON(raw)
-	var action modelAction
+	var action ModelAction
 	if err := json.Unmarshal([]byte(raw), &action); err != nil {
-		return modelAction{}, false
+		return ModelAction{}, err
 	}
-	action.Action = strings.TrimSpace(strings.ToLower(action.Action))
-	action.Message = strings.TrimSpace(action.Message)
+	action.Type = ActionType(strings.TrimSpace(strings.ToLower(string(action.Type))))
+	action.Reason = strings.TrimSpace(action.Reason)
 	action.Patch = strings.TrimSpace(action.Patch)
-	action.Command.Name = strings.TrimSpace(action.Command.Name)
-	action.Command.Reason = strings.TrimSpace(action.Command.Reason)
-	action.Command.Args = cleanArgs(action.Command.Args)
-	return action, true
+	action.Command = strings.TrimSpace(action.Command)
+	action.Summary = strings.TrimSpace(action.Summary)
+	action.Files = cleanArgs(action.Files)
+	if err := action.Validate(); err != nil {
+		return ModelAction{}, err
+	}
+	return action, nil
 }
 
 func extractJSON(text string) string {
@@ -277,22 +300,6 @@ func cleanArgs(args []string) []string {
 	return out
 }
 
-func parseStringList(raw json.RawMessage) []string {
-	raw = json.RawMessage(strings.TrimSpace(string(raw)))
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	var values []string
-	if err := json.Unmarshal(raw, &values); err == nil {
-		return cleanArgs(values)
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err == nil {
-		return strings.Fields(value)
-	}
-	return nil
-}
-
 func (o *Orchestrator) writePatchFile(run *memory.Run, patch string) (string, error) {
 	dir := filepath.Join(o.config.TesseraDir, "runs", firstNonEmpty(runID(run), "ad-hoc"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -308,29 +315,54 @@ func (o *Orchestrator) writePatchFile(run *memory.Run, patch string) (string, er
 	return path, nil
 }
 
-func commandString(name string, args []string) string {
-	if len(args) == 0 {
-		return name
+func splitCommand(command string) (string, []string) {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return "", nil
 	}
-	return name + " " + strings.Join(args, " ")
+	return parts[0], parts[1:]
 }
 
-func commandRisk(name string, args []string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "empty command"
+func commandOutput(out port.Output, err error) string {
+	output := strings.TrimSpace(strings.Join([]string{out.Stdout, out.Stderr}, "\n"))
+	if output == "" && err != nil {
+		output = err.Error()
 	}
-	if strings.ContainsAny(name, "&|;<>`$") {
-		return "blocked shell metacharacter in command name"
+	if len(output) > 12000 {
+		output = output[:12000] + "\n... output truncated"
 	}
-	for _, arg := range args {
-		if strings.ContainsAny(arg, "&|;<>`") {
-			return "blocked shell metacharacter in command arguments"
+	return output
+}
+
+func commandRisk(command string) string {
+	lower := strings.ToLower(strings.Join(strings.Fields(command), " "))
+	dangerous := []string{
+		"rm -rf",
+		"git reset --hard",
+		"git checkout .",
+		"git clean -fd",
+		"git push",
+		"curl",
+		"wget",
+	}
+	for _, pattern := range dangerous {
+		if strings.Contains(lower, pattern) {
+			if (pattern == "curl" || pattern == "wget") && !strings.Contains(lower, "| sh") {
+				continue
+			}
+			return "blocked dangerous command pattern: " + pattern
 		}
 	}
+	if strings.ContainsAny(command, "&;<>`") {
+		return "blocked shell metacharacter in command"
+	}
+	if strings.Contains(command, "|") {
+		return "blocked piped command"
+	}
 
+	name, args := splitCommand(command)
 	switch name {
-	case "rm", "rmdir", "mv", "cp", "chmod", "chown", "sudo", "su", "curl", "wget", "ssh", "scp", "rsync", "docker", "kubectl":
+	case "sudo", "su", "ssh", "scp", "rsync", "docker", "kubectl":
 		return "blocked potentially destructive or networked command"
 	case "git":
 		if len(args) == 0 {
