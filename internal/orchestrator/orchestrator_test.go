@@ -12,6 +12,7 @@ import (
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/llm"
 	"github.com/alef-mach/tessera/internal/memory/sqlite"
+	"github.com/alef-mach/tessera/internal/port"
 )
 
 func TestInteractiveInputCallsLLM(t *testing.T) {
@@ -43,7 +44,15 @@ func TestInteractiveInputCallsLLM(t *testing.T) {
 		t.Fatalf("expected 1 LLM request, got %d", len(model.requests))
 	}
 	req := model.requests[0]
-	if req.Prompt != "explique o projeto" || req.MaxTokens != 128 || req.SessionID == "" || req.RunID == "" {
+	for _, want := range []string{"# User task\nexplique o projeto", "# Project profile", "# Constraints"} {
+		if !strings.Contains(req.Prompt, want) {
+			t.Fatalf("expected prompt to contain %q, got:\n%s", want, req.Prompt)
+		}
+	}
+	if req.System == "" || !strings.Contains(req.System, "local-first interactive coding agent") {
+		t.Fatalf("expected Tessera system prompt, got %q", req.System)
+	}
+	if req.MaxTokens != 128 || req.SessionID == "" || req.RunID == "" {
 		t.Fatalf("unexpected LLM request: %#v", req)
 	}
 	if !ui.sawEvent("llm.call.started") {
@@ -151,6 +160,54 @@ func TestIndexSlashCommandPersistsSymbols(t *testing.T) {
 	}
 }
 
+func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/command\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{
+		resp: llm.GenerateResponse{
+			Text: `{"action":"run_command","message":"Run the focused Go tests.","command":{"name":"go","args":["test","./..."],"reason":"Verify the current project."}}`,
+		},
+	}
+	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
+	ui := &scriptedUI{lines: []string{"rode os testes\n", "/exit\n"}}
+	cfg := config.Config{
+		Provider:   "ollama",
+		Model:      "llama3.2",
+		MaxTokens:  128,
+		TesseraDir: t.TempDir(),
+	}
+
+	orch := New(model, store, ui, exec, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(exec.commands) != 1 {
+		t.Fatalf("expected one executed command, got %#v", exec.commands)
+	}
+	got := exec.commands[0]
+	if got.Name != "go" || strings.Join(got.Args, " ") != "test ./..." || got.Dir != root {
+		t.Fatalf("unexpected command: %#v", got)
+	}
+	if !ui.sawEvent("approval.requested") {
+		t.Fatal("expected approval request before command execution")
+	}
+	if !ui.sawEvent("test.finished") {
+		t.Fatalf("expected command result event, events=%#v", ui.events)
+	}
+}
+
 type fakeLLM struct {
 	requests []llm.GenerateRequest
 	resp     llm.GenerateResponse
@@ -160,6 +217,17 @@ type fakeLLM struct {
 func (f *fakeLLM) Generate(ctx context.Context, req llm.GenerateRequest) (llm.GenerateResponse, error) {
 	f.requests = append(f.requests, req)
 	return f.resp, f.err
+}
+
+type fakeExecutor struct {
+	commands []port.Command
+	out      port.Output
+	err      error
+}
+
+func (f *fakeExecutor) Run(ctx context.Context, cmd port.Command) (port.Output, error) {
+	f.commands = append(f.commands, cmd)
+	return f.out, f.err
 }
 
 type scriptedUI struct {
