@@ -2,13 +2,13 @@
 
 > A local-first interactive coding agent for small machines.
 
-Tessera is an experimental command-line coding agent designed to work with local LLMs and limited hardware.
+Tessera is an experimental command-line coding agent designed to work with local LLMs, limited hardware, and real projects that need careful handling.
 
 It is built around a simple idea:
 
 > Instead of sending an entire codebase to a huge model, Tessera breaks the work into small steps and builds understanding over time.
 
-Tessera is for developers who want an agent-like coding workflow in the terminal, but prefer to keep their code local, control what gets executed, and avoid depending on massive context windows.
+Tessera is for developers who want an agent-like coding workflow in the terminal, but prefer to keep their code local, control what gets executed, review changes before they are applied, and avoid depending on massive context windows.
 
 ---
 
@@ -26,6 +26,8 @@ small pieces of code
 small local model calls
   ↓
 structured understanding
+  ↓
+git-aware safety
   ↓
 safe actions
   ↓
@@ -52,18 +54,22 @@ Inside the session, you can describe what you want:
 › add a minimal implementation
 › show me the diff
 › run the tests again
+› suggest a commit message for these changes
 ```
 
 Tessera then works step by step:
 
 1. Looks at the current project.
-2. Builds a compact understanding of the relevant files.
-3. Asks the local model for the next small action.
-4. Shows what it wants to do.
-5. Requests approval before changing files or running risky commands.
-6. Applies changes.
-7. Runs tests.
-8. Stops when the task is complete or when it finds a clear blocker.
+2. Detects whether the directory is a Git repository.
+3. Checks the current working tree before editing.
+4. Builds a compact understanding of the relevant files.
+5. Asks the local model for the next small action.
+6. Shows what it wants to do.
+7. Requests approval before changing files or running risky commands.
+8. Applies changes.
+9. Saves diffs and run metadata locally.
+10. Runs tests.
+11. Stops when the task is complete or when it finds a clear blocker.
 
 ---
 
@@ -99,6 +105,25 @@ This makes it suitable for local LLM setups where memory is limited.
 
 ---
 
+### Git-aware safety
+
+Tessera is designed to work safely inside Git repositories.
+
+Before modifying a project, Tessera should be able to:
+
+- detect whether the current directory is a Git repository;
+- inspect the working tree;
+- warn when there are existing uncommitted changes;
+- avoid overwriting user changes without approval;
+- show diffs before applying patches;
+- save patches inside the local Tessera run history;
+- support rollback when Git metadata is available;
+- suggest commit messages without committing automatically.
+
+By default, Tessera should not commit, push, or rewrite Git history on its own.
+
+---
+
 ### Approval before action
 
 Tessera should never blindly modify your project.
@@ -119,7 +144,7 @@ It should not take over your terminal, clear your scrollback, or make it hard to
 
 ### Project-aware assistance
 
-Tessera can inspect the current folder, detect whether it is an empty directory or an existing project, identify likely test commands, and focus only on the relevant files.
+Tessera can inspect the current folder, detect whether it is an empty directory or an existing project, identify likely test commands, check for Git, and focus only on the relevant files.
 
 ---
 
@@ -127,23 +152,7 @@ Tessera can inspect the current folder, detect whether it is an empty directory 
 
 Tessera uses tests to verify progress.
 
-It can work with lightweight unit tests, focused integration tests, or heavier project test suites, as long as those tests can run locally in the current environment.
-
-The goal is not to pretend every test is cheap. The goal is to use test execution as a reliable feedback loop:
-
-```text
-change
-  ↓
-run relevant tests
-  ↓
-analyze failure
-  ↓
-adjust
-  ↓
-verify again
-```
-
-When a full test suite is too slow, Tessera should prefer narrower test commands first, then escalate when needed.
+A typical task is considered complete when the relevant test command runs successfully.
 
 If a required tool is missing, Tessera should report the blocker clearly instead of silently installing global tools.
 
@@ -151,9 +160,9 @@ If a required tool is missing, Tessera should report the blocker clearly instead
 
 ### Persistent local memory
 
-Tessera keeps a local record of sessions, actions, prompts, responses, command results, patches, and observations.
+Tessera keeps a local record of sessions, actions, prompts, responses, command results, patches, diffs, and observations.
 
-This makes it easier to inspect what happened, resume work, or debug a previous run.
+This makes it easier to inspect what happened, resume work, debug a previous run, or roll back a change when possible.
 
 ---
 
@@ -171,6 +180,7 @@ Project: ~/code/example-app
 Model:   local-model
 Context: bounded
 Memory:  local
+Git:     clean
 
 Type your task or /help.
 
@@ -182,6 +192,9 @@ Tessera may respond:
 ```text
 ● Inspecting project
   Found an existing Node project.
+
+● Checking Git status
+  Working tree is clean.
 
 ● Selecting relevant files
   package.json
@@ -200,6 +213,12 @@ After approval:
 
 ✓ Test passed
 
+Changed files:
+  A src/sum.test.ts
+
+Suggested commit:
+  test(sum): add initial unit test
+
 Task completed.
 ```
 
@@ -213,6 +232,9 @@ Inside the interactive session, Tessera may support commands such as:
 /help
 /status
 /diff
+/git
+/rollback
+/commit-message
 /approve
 /deny
 /context
@@ -224,6 +246,55 @@ Inside the interactive session, Tessera may support commands such as:
 
 These commands make the session easier to inspect and control without leaving the terminal.
 
+Examples:
+
+```text
+› /diff
+```
+
+Shows the pending or latest patch.
+
+```text
+› /git
+```
+
+Shows the detected Git state for the current project.
+
+```text
+› /commit-message
+```
+
+Suggests a commit message for the current approved changes.
+
+```text
+› /rollback
+```
+
+Attempts to roll back the latest Tessera-applied change when enough metadata is available.
+
+---
+
+## Planned CLI commands
+
+The main workflow is the interactive session:
+
+```bash
+tessera
+```
+
+Support commands may include:
+
+```bash
+tessera run "create the first unit test"
+tessera doctor
+tessera index
+tessera git status
+tessera rollback <run-id>
+tessera replay <run-id>
+```
+
+The goal is to keep `tessera` as the primary experience and use subcommands for automation, debugging, CI, and recovery.
+
 ---
 
 ## What Tessera is good for
@@ -232,41 +303,13 @@ Tessera is intended for tasks such as:
 
 - creating a minimal project structure;
 - adding the first unit test;
-- fixing test failures using local feedback;
-- running focused unit tests, integration tests, or larger test suites when available;
-- working through slower test loops when local execution is acceptable;
-- understanding a small or medium codebase incrementally;
+- fixing simple or medium test failures;
+- understanding a small or medium codebase;
 - making localized changes;
 - reviewing proposed diffs before applying them;
-- iterating on code until tests pass or a clear blocker is found;
+- running tests after changes;
+- suggesting commit messages;
 - working with local LLMs on limited hardware.
-
-Tessera is especially useful when you are willing to trade speed for locality, control, and lower memory requirements.
-
----
-
-## Tradeoffs
-
-Tessera is not trying to be a drop-in replacement for every coding agent. It makes a different set of tradeoffs.
-
-| Tool | Best fit | Main strength | Main tradeoff |
-|---|---|---|---|
-| **Codex CLI** | Fast agentic coding with strong model support | Powerful coding workflow, command execution, file editing, sandboxed local operation | Usually depends on remote OpenAI models and may not be ideal for fully local/offline workflows |
-| **Claude Code / Claude CLI** | High-capability terminal agent for larger development tasks | Strong reasoning, codebase understanding, command execution, and autonomous workflows | Usually depends on Anthropic-hosted models and may be heavier than a small local-only setup |
-| **Aider** | AI pair programming in the terminal | Mature terminal workflow, good Git integration, repo map, broad model support including local models | More pair-programming oriented; local small-model performance depends heavily on context and model quality |
-| **Tessera** | Local-first coding on limited hardware | Small-context workflow, many small local calls, explicit approvals, copy-friendly interactive session | Slower by design and initially less capable than agents backed by frontier remote models |
-
-Tessera's core bet is different:
-
-```text
-less context
-more steps
-local model
-explicit control
-tests as verification
-```
-
-This means Tessera may be slower than cloud-backed coding agents, but it aims to be more suitable for developers who care about locality, predictable resource use, and working with small local models.
 
 ---
 
@@ -279,9 +322,29 @@ At least initially, Tessera is not trying to be:
 - a tool that edits your project without approval;
 - a system that depends on massive context windows;
 - an agent that installs global toolchains automatically;
+- an agent that commits or pushes code without permission;
 - a magic solution for large, risky refactors.
 
 Tessera favors control, locality, and incremental progress.
+
+---
+
+## Safety model
+
+Tessera should treat the local repository as user-owned and sensitive.
+
+The default safety model is:
+
+- read only what is relevant;
+- avoid sensitive files by default;
+- ask before modifying files;
+- ask before installing project dependencies;
+- block dangerous commands;
+- keep command output and patches in local run history;
+- use Git status and diffs as part of the review flow;
+- use tests as the main verification signal.
+
+This is especially important when working with local models, where the orchestrator should remain deterministic and the model should not control the whole system directly.
 
 ---
 
@@ -294,6 +357,7 @@ The goal is to build a practical local coding agent that prioritizes:
 - small context windows;
 - interactive terminal UX;
 - user approval;
+- Git-aware safety;
 - local memory;
 - test-driven verification;
 - compatibility with limited hardware.
@@ -320,7 +384,7 @@ Instead of asking:
 
 Tessera asks:
 
-> How far can we get with a small local model, careful context management, and good verification?
+> How far can we get with a small local model, careful context management, Git-aware safety, and good verification?
 
 ---
 
