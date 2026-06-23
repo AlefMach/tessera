@@ -1,21 +1,9 @@
 package ollama
 
-import (
-	"context"
-	"errors"
+import newollama "github.com/alef-mach/tessera/internal/llm/ollama"
 
-	"github.com/alef-mach/tessera/internal/port"
-)
-
-type LLM struct {
-	baseURL string
-	model   string
-}
+type LLM = newollama.OllamaLLM
 
 func NewLLM(baseURL, model string) *LLM {
-	return &LLM{baseURL: baseURL, model: model}
-}
-
-func (l *LLM) Generate(ctx context.Context, req port.GenerateRequest) (port.GenerateResponse, error) {
-	return port.GenerateResponse{}, errors.New("ollama adapter is not implemented yet")
+	return newollama.NewOllamaLLM(baseURL, model)
 }

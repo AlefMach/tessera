@@ -11,6 +11,7 @@ import (
 
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
+	"github.com/alef-mach/tessera/internal/llm"
 	"github.com/alef-mach/tessera/internal/memory"
 	"github.com/alef-mach/tessera/internal/port"
 	"github.com/alef-mach/tessera/internal/session"
@@ -87,12 +88,54 @@ func (o *Orchestrator) interactive(ctx context.Context) error {
 			o.renderMemory(ctx)
 		default:
 			run := o.startRun(ctx, input)
-			o.emit(ctx, event.New("task.received", "Task received", "LLM execution is not implemented in Milestone 0.", map[string]any{
-				"input": input,
-			}))
+			o.executeLLM(ctx, run, input)
 			o.finishRun(ctx, run)
 		}
 	}
+}
+
+func (o *Orchestrator) executeLLM(ctx context.Context, run *memory.Run, input string) {
+	if o.llm == nil {
+		o.emit(ctx, event.New("error.occurred", "LLM unavailable", "No LLM provider is configured.", map[string]any{
+			"error": "llm provider is nil",
+		}))
+		return
+	}
+
+	runID := ""
+	if run != nil {
+		runID = run.ID
+		run.Calls++
+	}
+
+	o.emit(ctx, event.New("llm.call.started", "LLM call started", "", map[string]any{
+		"provider": o.config.Provider,
+		"model":    o.config.Model,
+		"run_id":   runID,
+	}))
+
+	resp, err := o.llm.Generate(ctx, llm.GenerateRequest{
+		Prompt:    input,
+		MaxTokens: o.config.MaxTokens,
+		SessionID: o.session.ID,
+		RunID:     runID,
+	})
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "LLM call failed", err.Error(), map[string]any{
+			"error":  err.Error(),
+			"run_id": runID,
+		}))
+		return
+	}
+
+	o.emit(ctx, event.New("llm.call.finished", "LLM response", strings.TrimSpace(resp.Text), map[string]any{
+		"provider":      o.config.Provider,
+		"model":         firstNonEmpty(resp.Model, o.config.Model),
+		"input_tokens":  resp.InputTokens,
+		"output_tokens": resp.OutputTokens,
+		"duration":      resp.Duration.Truncate(time.Millisecond).String(),
+		"run_id":        runID,
+	}))
 }
 
 func (o *Orchestrator) renderHelp(ctx context.Context) {
@@ -164,6 +207,15 @@ func (o *Orchestrator) startRun(ctx context.Context, input string) *memory.Run {
 
 func oneLine(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (o *Orchestrator) finishRun(ctx context.Context, run *memory.Run) {

@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/alef-mach/tessera/internal/adapter/executor/localexec"
-	"github.com/alef-mach/tessera/internal/adapter/llm/ollama"
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
+	"github.com/alef-mach/tessera/internal/llm/ollama"
 	"github.com/alef-mach/tessera/internal/memory/sqlite"
 	"github.com/alef-mach/tessera/internal/orchestrator"
 	"github.com/alef-mach/tessera/internal/trust"
@@ -116,7 +117,7 @@ func runInteractive(ctx context.Context, cfg config.Config) error {
 	}
 
 	memory := sqlite.NewMemoryStore(cfg.SQLitePath)
-	llm := ollama.NewLLM(cfg.OllamaURL, cfg.Model)
+	llm := ollama.NewOllamaLLM(cfg.OllamaURL, cfg.Model, ollama.WithMemoryStore(memory))
 	executor := localexec.NewExecutor()
 
 	orch := orchestrator.New(llm, memory, ui, executor, cfg)
@@ -175,6 +176,16 @@ func runDoctor(cfg config.Config) error {
 	fmt.Printf("CWD:            %s\n", cwd)
 	fmt.Printf("Provider:       %s\n", cfg.Provider)
 	fmt.Printf("Model:          %s\n", cfg.Model)
+	fmt.Printf("Ollama URL:     %s\n", cfg.OllamaURL)
+	if cfg.Provider == "ollama" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := ollama.Check(ctx, cfg.OllamaURL, nil); err != nil {
+			fmt.Printf("Ollama: error (%s)\n", err)
+		} else {
+			fmt.Println("Ollama: connected")
+		}
+	}
 	fmt.Printf("Memory:         local (%s)\n", cfg.SQLitePath)
 	fmt.Printf("Context:        bounded (%d tokens)\n", cfg.ContextTokens)
 	fmt.Printf("Max tokens:     %d\n", cfg.MaxTokens)

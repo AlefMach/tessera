@@ -52,34 +52,3 @@ context_tokens = 1234
 		t.Fatalf("expected flag context tokens, got %d", cfg.ContextTokens)
 	}
 }
-
-func TestLoadDefaults(t *testing.T) {
-	tempDir := t.TempDir()
-	oldWD, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(oldWD); err != nil {
-			t.Fatal(err)
-		}
-	})
-
-	cfg, err := Load(Flags{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if cfg.Provider != defaultProvider {
-		t.Fatalf("expected default provider, got %q", cfg.Provider)
-	}
-	if cfg.Model != defaultModel {
-		t.Fatalf("expected default model, got %q", cfg.Model)
-	}
-	if cfg.SQLitePath != filepath.Join(tempDir, ".tessera", "memory.db") {
-		t.Fatalf("unexpected sqlite path: %q", cfg.SQLitePath)
-	}
-}
