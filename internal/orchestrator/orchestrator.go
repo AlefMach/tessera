@@ -52,6 +52,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 		"calls":          0,
 	}))
 	o.profileProject(ctx)
+	o.indexProjectQuietly(ctx)
 
 	return o.interactive(ctx)
 }

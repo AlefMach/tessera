@@ -11,6 +11,7 @@ import (
 
 const tesseraSystemPrompt = `You are Tessera, a local-first interactive coding agent.
 
+After a verification command succeeds with status ok and exit_code 0, prefer "finish" unless there is a specific remaining failing test, unapplied patch, or unresolved blocker. Do not run another test command just to be extra sure.
 Choose exactly one small next action at a time. Use the provided project context, git state, memory, and repo map.
 Do not claim you changed files unless an approved tool action actually changed them.
 Prefer narrow test commands before broad suites.
@@ -34,7 +35,7 @@ Use "run" for relevant local tests or verification commands.
 Use "finish" only when the task is actually complete.
 Use "blocker" when missing information, missing tools, or risk of overwriting user work prevents safe progress.`
 
-func (o *Orchestrator) buildPrompt(ctx context.Context, input string) string {
+func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousResult string) string {
 	profile, err := o.memory.GetProjectProfile(ctx, o.session.ID)
 	if err != nil {
 		profile = o.profileProject(ctx)
@@ -42,8 +43,16 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, input string) string {
 
 	var b strings.Builder
 	b.WriteString("# User task\n")
-	b.WriteString(input)
-	b.WriteString("\n\n# Project profile\n")
+	b.WriteString(task)
+	b.WriteString("\n")
+
+	if strings.TrimSpace(previousResult) != "" {
+		b.WriteString("\n# Previous action result\n")
+		b.WriteString(previousResult)
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n# Project profile\n")
 	fmt.Fprintf(&b, "- root: %s\n", profile.Root)
 	fmt.Fprintf(&b, "- mode: %s\n", profile.Mode)
 	fmt.Fprintf(&b, "- stack: %s\n", profile.Stack)
@@ -86,6 +95,8 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, input string) string {
 	b.WriteString("\n# Example response\n")
 	b.WriteString(`{"type":"inspect","reason":"I need to understand how the orchestrator calls the LLM today.","files":["internal/orchestrator/orchestrator.go","internal/orchestrator/llm.go"]}`)
 	b.WriteString("\n")
+	b.WriteString("- After a verification command succeeds with status ok and exit_code 0, prefer finish unless there is a specific remaining failing test, unapplied patch, or unresolved blocker.\n")
+	b.WriteString("- Do not run another test command just to be extra sure.\n")
 
 	return truncateMiddle(b.String(), o.promptCharBudget())
 }
@@ -156,6 +167,26 @@ func (o *Orchestrator) promptCharBudget() int {
 	// A conservative approximation keeps local-model prompts bounded without
 	// depending on provider-specific tokenizers.
 	return max(4000, o.config.ContextTokens*3)
+}
+
+func appendInvalidActionRepairPrompt(prompt string, previousResponse string, previousErr error) string {
+	var b strings.Builder
+	b.WriteString(prompt)
+	b.WriteString("\n# Previous response was invalid\n")
+	b.WriteString("Your previous response was not valid Tessera action JSON. Return only valid JSON now.\n")
+	if previousErr != nil {
+		b.WriteString("Error: ")
+		b.WriteString(previousErr.Error())
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(previousResponse) != "" {
+		b.WriteString("Previous response:\n")
+		b.WriteString(previousResponse)
+		b.WriteString("\n")
+	}
+	b.WriteString(`Expected shape: {"type":"inspect|patch|run|finish|blocker","reason":"...","files":["..."],"patch":"...","command":"...","summary":"..."}`)
+	b.WriteString("\n")
+	return b.String()
 }
 
 func truncateMiddle(value string, limit int) string {

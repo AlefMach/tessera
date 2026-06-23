@@ -96,6 +96,16 @@ func (o *Orchestrator) renderMemory(ctx context.Context) {
 	}))
 }
 
+func (o *Orchestrator) indexProjectQuietly(ctx context.Context) {
+	_, err := treesitter.New(o.session.CWD, o.memory).Index(ctx, o.session.ID)
+	if err != nil {
+		o.emit(ctx, event.New("index.skipped", "Index skipped", err.Error(), map[string]any{
+			"root":  o.session.CWD,
+			"error": err.Error(),
+		}))
+	}
+}
+
 func (o *Orchestrator) renderIndex(ctx context.Context) {
 	o.emit(ctx, event.New("index.started", "Indexing with Tree-sitter", "", map[string]any{
 		"root": o.session.CWD,

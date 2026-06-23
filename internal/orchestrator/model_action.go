@@ -122,6 +122,9 @@ func (o *Orchestrator) readWorkspaceFile(rel string) (string, error) {
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
 		return "", fmt.Errorf("path outside workspace is not allowed: %s", rel)
 	}
+	if isSensitiveWorkspacePath(clean) {
+		return "", fmt.Errorf("sensitive file is not inspectable by default: %s", rel)
+	}
 	path := filepath.Join(o.session.CWD, clean)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -132,6 +135,44 @@ func (o *Orchestrator) readWorkspaceFile(rel string) (string, error) {
 		content = content[:maxInspectFileBytes] + "\n... file truncated ..."
 	}
 	return content, nil
+}
+
+func isSensitiveWorkspacePath(path string) bool {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+
+	lower := strings.ToLower(path)
+	base := strings.ToLower(filepath.Base(path))
+
+	if lower == ".git" || strings.HasPrefix(lower, ".git/") {
+		return true
+	}
+	if lower == ".tessera" || strings.HasPrefix(lower, ".tessera/") {
+		return true
+	}
+	if strings.HasPrefix(base, ".env") {
+		return true
+	}
+
+	sensitiveNames := map[string]bool{
+		"id_rsa":               true,
+		"id_dsa":               true,
+		"id_ecdsa":             true,
+		"id_ed25519":           true,
+		"credentials":          true,
+		"credentials.json":     true,
+		"service-account.json": true,
+	}
+	if sensitiveNames[base] {
+		return true
+	}
+
+	return strings.HasSuffix(base, ".pem") ||
+		strings.HasSuffix(base, ".key") ||
+		strings.HasSuffix(base, ".p12") ||
+		strings.HasSuffix(base, ".pfx")
 }
 
 func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
@@ -245,7 +286,15 @@ func (o *Orchestrator) executeRun(ctx context.Context, run *memory.Run, action M
 		"status":    status,
 		"exit_code": out.ExitCode,
 	})
-	return output, false, nil
+	result := strings.TrimSpace(fmt.Sprintf(
+		"command: %s\nstatus: %s\nexit_code: %d\n\n%s",
+		commandText,
+		status,
+		out.ExitCode,
+		output,
+	))
+
+	return result, false, nil
 }
 
 func parseModelAction(text string) (ModelAction, error) {

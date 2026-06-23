@@ -25,3 +25,9 @@ func runID(run *memory.Run) string {
 	}
 	return run.ID
 }
+
+func isSuccessfulRunResult(result string) bool {
+	lower := strings.ToLower(result)
+	return strings.Contains(lower, "status: ok") &&
+		strings.Contains(lower, "exit_code: 0")
+}
