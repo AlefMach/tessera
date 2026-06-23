@@ -127,7 +127,23 @@ Tessera can inspect the current folder, detect whether it is an empty directory 
 
 Tessera uses tests to verify progress.
 
-A typical task is considered complete when the relevant test command runs successfully.
+It can work with lightweight unit tests, focused integration tests, or heavier project test suites, as long as those tests can run locally in the current environment.
+
+The goal is not to pretend every test is cheap. The goal is to use test execution as a reliable feedback loop:
+
+```text
+change
+  ↓
+run relevant tests
+  ↓
+analyze failure
+  ↓
+adjust
+  ↓
+verify again
+```
+
+When a full test suite is too slow, Tessera should prefer narrower test commands first, then escalate when needed.
 
 If a required tool is missing, Tessera should report the blocker clearly instead of silently installing global tools.
 
@@ -216,11 +232,41 @@ Tessera is intended for tasks such as:
 
 - creating a minimal project structure;
 - adding the first unit test;
-- fixing simple or medium test failures;
-- understanding a small or medium codebase;
+- fixing test failures using local feedback;
+- running focused unit tests, integration tests, or larger test suites when available;
+- working through slower test loops when local execution is acceptable;
+- understanding a small or medium codebase incrementally;
 - making localized changes;
 - reviewing proposed diffs before applying them;
+- iterating on code until tests pass or a clear blocker is found;
 - working with local LLMs on limited hardware.
+
+Tessera is especially useful when you are willing to trade speed for locality, control, and lower memory requirements.
+
+---
+
+## Tradeoffs
+
+Tessera is not trying to be a drop-in replacement for every coding agent. It makes a different set of tradeoffs.
+
+| Tool | Best fit | Main strength | Main tradeoff |
+|---|---|---|---|
+| **Codex CLI** | Fast agentic coding with strong model support | Powerful coding workflow, command execution, file editing, sandboxed local operation | Usually depends on remote OpenAI models and may not be ideal for fully local/offline workflows |
+| **Claude Code / Claude CLI** | High-capability terminal agent for larger development tasks | Strong reasoning, codebase understanding, command execution, and autonomous workflows | Usually depends on Anthropic-hosted models and may be heavier than a small local-only setup |
+| **Aider** | AI pair programming in the terminal | Mature terminal workflow, good Git integration, repo map, broad model support including local models | More pair-programming oriented; local small-model performance depends heavily on context and model quality |
+| **Tessera** | Local-first coding on limited hardware | Small-context workflow, many small local calls, explicit approvals, copy-friendly interactive session | Slower by design and initially less capable than agents backed by frontier remote models |
+
+Tessera's core bet is different:
+
+```text
+less context
+more steps
+local model
+explicit control
+tests as verification
+```
+
+This means Tessera may be slower than cloud-backed coding agents, but it aims to be more suitable for developers who care about locality, predictable resource use, and working with small local models.
 
 ---
 
