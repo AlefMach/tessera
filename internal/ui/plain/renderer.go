@@ -139,10 +139,12 @@ func (r *Renderer) renderProjectProfiled(evt event.Event) {
 	r.writeTitle("◇", titleOr(evt, "Project profiled"), evt.Timestamp)
 	rows := []string{
 		kv("root", dataString(evt.Data, "root", "cwd", "project")),
-		kv("language", dataString(evt.Data, "language", "languages")),
-		kv("files", dataString(evt.Data, "files", "file_count")),
-		kv("tests", dataString(evt.Data, "tests", "test_command")),
-		kv("git", dataString(evt.Data, "git", "git_status")),
+		kv("mode", dataString(evt.Data, "mode")),
+		kv("stack", dataString(evt.Data, "stack")),
+		kv("manifests", dataString(evt.Data, "manifests")),
+		kv("git", dataString(evt.Data, "git")),
+		kv("tests", dataString(evt.Data, "tests")),
+		kv("test runner", dataString(evt.Data, "test_runner")),
 	}
 	r.writeRows(rows)
 	r.writeMarkdown(evt.Message)

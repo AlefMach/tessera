@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/alef-mach/tessera/internal/event"
+	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
@@ -98,6 +99,8 @@ type Store interface {
 	SaveSymbol(ctx context.Context, symbol Symbol) error
 	GetSymbol(ctx context.Context, symbolID string) (Symbol, error)
 	ListSymbols(ctx context.Context, sessionID string) ([]Symbol, error)
+	SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error
+	GetProjectProfile(ctx context.Context, sessionID string) (project.ProjectProfile, error)
 	SaveEvent(ctx context.Context, sessionID string, evt event.Event) error
 	ListEvents(ctx context.Context, sessionID string) ([]event.Event, error)
 	Stats(ctx context.Context, sessionID string) (Stats, error)

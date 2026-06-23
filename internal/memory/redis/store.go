@@ -6,6 +6,7 @@ import (
 
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/memory"
+	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
@@ -69,6 +70,12 @@ func (s *MemoryStore) GetSymbol(ctx context.Context, symbolID string) (memory.Sy
 }
 func (s *MemoryStore) ListSymbols(ctx context.Context, sessionID string) ([]memory.Symbol, error) {
 	return nil, ErrNotImplemented
+}
+func (s *MemoryStore) SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error {
+	return ErrNotImplemented
+}
+func (s *MemoryStore) GetProjectProfile(ctx context.Context, sessionID string) (project.ProjectProfile, error) {
+	return project.ProjectProfile{}, ErrNotImplemented
 }
 func (s *MemoryStore) SaveEvent(ctx context.Context, sessionID string, evt event.Event) error {
 	return ErrNotImplemented

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/alef-mach/tessera/internal/llm"
 	"github.com/alef-mach/tessera/internal/memory"
 	"github.com/alef-mach/tessera/internal/port"
+	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
@@ -52,6 +54,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 		"max_tokens":     o.config.MaxTokens,
 		"calls":          0,
 	}))
+	o.profileProject(ctx)
 
 	return o.interactive(ctx)
 }
@@ -148,15 +151,52 @@ func (o *Orchestrator) renderStatus(ctx context.Context) {
 		o.emit(ctx, event.New("error.occurred", "Status unavailable", err.Error(), map[string]any{"error": err.Error()}))
 		return
 	}
+	profile, err := o.memory.GetProjectProfile(ctx, o.session.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			profile = o.profileProject(ctx)
+		} else {
+			o.emit(ctx, event.New("error.occurred", "Profile unavailable", err.Error(), map[string]any{"error": err.Error()}))
+			return
+		}
+	}
 	o.emit(ctx, event.New("status", "Status", "", map[string]any{
 		"session":      stats.SessionID,
 		"provider":     stats.Provider,
 		"model":        stats.Model,
+		"mode":         profile.Mode,
+		"stack":        profile.Stack,
+		"git":          profile.HasGit,
+		"tests":        profile.HasTests,
+		"test_runner":  profile.TestRunner,
 		"calls":        stats.Calls,
 		"steps":        stats.Steps,
 		"runs":         stats.Runs,
 		"observations": stats.Observations,
 	}))
+}
+
+func (o *Orchestrator) profileProject(ctx context.Context) project.ProjectProfile {
+	profile, err := project.Profile(o.session.CWD)
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "Project profile unavailable", err.Error(), map[string]any{"error": err.Error()}))
+		return project.ProjectProfile{}
+	}
+	profile.SessionID = o.session.ID
+	if err := o.memory.SaveProjectProfile(ctx, profile); err != nil {
+		o.emit(ctx, event.New("error.occurred", "Project profile not saved", err.Error(), map[string]any{"error": err.Error()}))
+		return profile
+	}
+	o.emit(ctx, event.New("project.profiled", "Project profiled", "", map[string]any{
+		"root":        profile.Root,
+		"mode":        profile.Mode,
+		"stack":       profile.Stack,
+		"manifests":   profile.Manifests,
+		"git":         profile.HasGit,
+		"tests":       profile.HasTests,
+		"test_runner": profile.TestRunner,
+	}))
+	return profile
 }
 
 func (o *Orchestrator) renderMemory(ctx context.Context) {

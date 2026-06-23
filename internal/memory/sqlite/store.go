@@ -12,6 +12,7 @@ import (
 
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/memory"
+	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
@@ -326,6 +327,51 @@ func (s *MemoryStore) ListSymbols(ctx context.Context, sessionID string) ([]memo
 	return symbols, rows.Err()
 }
 
+func (s *MemoryStore) SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	manifests, err := json.Marshal(profile.Manifests)
+	if err != nil {
+		return err
+	}
+	stacks, err := json.Marshal(profile.Stacks)
+	if err != nil {
+		return err
+	}
+	testPaths, err := json.Marshal(profile.TestPaths)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO project_profiles (session_id, root, mode, stack, stacks, manifests, has_git, has_tests, test_paths, test_runner, profiled_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_id) DO UPDATE SET
+			root = excluded.root,
+			mode = excluded.mode,
+			stack = excluded.stack,
+			stacks = excluded.stacks,
+			manifests = excluded.manifests,
+			has_git = excluded.has_git,
+			has_tests = excluded.has_tests,
+			test_paths = excluded.test_paths,
+			test_runner = excluded.test_runner,
+			profiled_at = excluded.profiled_at
+	`, profile.SessionID, profile.Root, profile.Mode, profile.Stack, string(stacks), string(manifests), profile.HasGit, profile.HasTests, string(testPaths), profile.TestRunner, profile.ProfiledAt)
+	return err
+}
+
+func (s *MemoryStore) GetProjectProfile(ctx context.Context, sessionID string) (project.ProjectProfile, error) {
+	if err := s.ready(); err != nil {
+		return project.ProjectProfile{}, err
+	}
+	return scanProjectProfile(s.db.QueryRowContext(ctx, `
+		SELECT session_id, root, mode, stack, stacks, manifests, has_git, has_tests, test_paths, test_runner, profiled_at
+		FROM project_profiles
+		WHERE session_id = ?
+	`, sessionID))
+}
+
 func (s *MemoryStore) SaveEvent(ctx context.Context, sessionID string, evt event.Event) error {
 	if evt.Timestamp.IsZero() {
 		evt.Timestamp = memoryTimestamp()
@@ -457,6 +503,19 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			summary TEXT NOT NULL,
 			updated_at TIMESTAMP NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS project_profiles (
+			session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+			root TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			stack TEXT NOT NULL,
+			stacks TEXT NOT NULL DEFAULT '[]',
+			manifests TEXT NOT NULL DEFAULT '[]',
+			has_git BOOLEAN NOT NULL DEFAULT 0,
+			has_tests BOOLEAN NOT NULL DEFAULT 0,
+			test_paths TEXT NOT NULL DEFAULT '[]',
+			test_runner TEXT NOT NULL,
+			profiled_at TIMESTAMP NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -518,6 +577,25 @@ func scanSymbol(row rowScanner) (memory.Symbol, error) {
 	var symbol memory.Symbol
 	err := row.Scan(&symbol.ID, &symbol.SessionID, &symbol.Name, &symbol.Kind, &symbol.Path, &symbol.Line, &symbol.Summary, &symbol.UpdatedAt)
 	return symbol, err
+}
+
+func scanProjectProfile(row rowScanner) (project.ProjectProfile, error) {
+	var profile project.ProjectProfile
+	var stacks, manifests, testPaths string
+	err := row.Scan(&profile.SessionID, &profile.Root, &profile.Mode, &profile.Stack, &stacks, &manifests, &profile.HasGit, &profile.HasTests, &testPaths, &profile.TestRunner, &profile.ProfiledAt)
+	if err != nil {
+		return project.ProjectProfile{}, err
+	}
+	if err := json.Unmarshal([]byte(stacks), &profile.Stacks); err != nil {
+		return project.ProjectProfile{}, err
+	}
+	if err := json.Unmarshal([]byte(manifests), &profile.Manifests); err != nil {
+		return project.ProjectProfile{}, err
+	}
+	if err := json.Unmarshal([]byte(testPaths), &profile.TestPaths); err != nil {
+		return project.ProjectProfile{}, err
+	}
+	return profile, nil
 }
 
 func nullString(value string) any {

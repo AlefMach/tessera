@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +62,51 @@ func TestInteractiveInputCallsLLM(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesProjectProfile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/status\n")
+	writeTestFile(t, filepath.Join(root, "service_test.go"), "package status\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	ui := &scriptedUI{lines: []string{"/status\n", "/exit\n"}}
+	cfg := config.Config{
+		Provider:   "ollama",
+		Model:      "llama3.2",
+		MaxTokens:  128,
+		TesseraDir: t.TempDir(),
+	}
+
+	orch := New(&fakeLLM{}, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	status := ui.eventByType("status")
+	if status.Type == "" {
+		t.Fatalf("expected status event, events=%#v", ui.events)
+	}
+	for key, want := range map[string]any{
+		"mode":        "existing_project",
+		"stack":       "Go",
+		"git":         false,
+		"tests":       true,
+		"test_runner": "go test ./...",
+	} {
+		if got := status.Data[key]; got != want {
+			t.Fatalf("expected status %s=%#v, got %#v in %#v", key, want, got, status.Data)
+		}
+	}
+}
+
 type fakeLLM struct {
 	requests []llm.GenerateRequest
 	resp     llm.GenerateResponse
@@ -111,4 +157,20 @@ func (s *scriptedUI) sawMessage(message string) bool {
 		}
 	}
 	return false
+}
+
+func (s *scriptedUI) eventByType(eventType string) event.Event {
+	for _, evt := range s.events {
+		if evt.Type == eventType {
+			return evt
+		}
+	}
+	return event.Event{}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }

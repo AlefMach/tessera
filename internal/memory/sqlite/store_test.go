@@ -8,6 +8,7 @@ import (
 
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/memory"
+	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
@@ -126,5 +127,54 @@ func TestMemoryStorePersistsSessionRunCallAndObservations(t *testing.T) {
 	}
 	if stats.Calls != 1 || stats.Steps != 2 || stats.Runs != 1 || stats.Observations != 2 {
 		t.Fatalf("unexpected stats: %#v", stats)
+	}
+}
+
+func TestMemoryStorePersistsProjectProfile(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	if err := store.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	sess := session.Session{
+		ID:        "sess-profile",
+		CWD:       "/tmp/project",
+		Provider:  "ollama",
+		Model:     "llama",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.SaveSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := project.ProjectProfile{
+		SessionID:  sess.ID,
+		Root:       sess.CWD,
+		Mode:       project.ModeExistingProject,
+		Stack:      "Go",
+		Stacks:     []string{"Go"},
+		Manifests:  []string{"go.mod"},
+		HasGit:     true,
+		HasTests:   true,
+		TestPaths:  []string{"main_test.go"},
+		TestRunner: "go test ./...",
+		ProfiledAt: now,
+	}
+	if err := store.SaveProjectProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetProjectProfile(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stack != "Go" || got.TestRunner != "go test ./..." || !got.HasGit || !got.HasTests {
+		t.Fatalf("unexpected profile: %#v", got)
+	}
+	if len(got.Manifests) != 1 || got.Manifests[0] != "go.mod" {
+		t.Fatalf("unexpected manifests: %#v", got.Manifests)
 	}
 }
