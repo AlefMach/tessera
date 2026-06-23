@@ -15,6 +15,8 @@ import (
 	"github.com/alef-mach/tessera/internal/llm/ollama"
 	"github.com/alef-mach/tessera/internal/memory/sqlite"
 	"github.com/alef-mach/tessera/internal/orchestrator"
+	"github.com/alef-mach/tessera/internal/session"
+	"github.com/alef-mach/tessera/internal/treesitter"
 	"github.com/alef-mach/tessera/internal/trust"
 	"github.com/alef-mach/tessera/internal/ui/plain"
 )
@@ -67,7 +69,17 @@ func newRootCommand() *cobra.Command {
 		},
 	})
 
-	root.AddCommand(stubCommand("index", "Index project files"))
+	root.AddCommand(&cobra.Command{
+		Use:   "index",
+		Short: "Index project files",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfigFromCommand(cmd, flags)
+			if err != nil {
+				return err
+			}
+			return runIndex(cmd.Context(), cfg)
+		},
+	})
 	root.AddCommand(stubCommand("config", "Inspect or update Tessera config"))
 	root.AddCommand(stubCommand("memory", "Inspect Tessera memory"))
 	root.AddCommand(stubCommand("replay", "Replay a previous Tessera session"))
@@ -191,6 +203,32 @@ func runDoctor(cfg config.Config) error {
 	fmt.Printf("Max tokens:     %d\n", cfg.MaxTokens)
 	fmt.Printf("Tessera dir:    %s\n", cfg.TesseraDir)
 	fmt.Printf("Go heap alloc:  %d bytes\n", stats.Alloc)
+	return nil
+}
+
+func runIndex(ctx context.Context, cfg config.Config) error {
+	ui := plain.NewRenderer()
+	if ok, err := ensureTrustedFolder(ui); err != nil || !ok {
+		return err
+	}
+	memory := sqlite.NewMemoryStore(cfg.SQLitePath)
+	if err := memory.Ensure(ctx); err != nil {
+		return err
+	}
+	manager := session.NewManager(memory)
+	sess, err := manager.Start(ctx, cfg.Provider, cfg.Model)
+	if err != nil {
+		return err
+	}
+	result, err := treesitter.New(sess.CWD, memory).Index(ctx, sess.ID)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "Indexed %d files and %d symbols.\n", result.Files, result.Symbols)
+	if result.RepoMap != "" {
+		fmt.Fprintln(os.Stdout)
+		fmt.Fprintln(os.Stdout, result.RepoMap)
+	}
 	return nil
 }
 

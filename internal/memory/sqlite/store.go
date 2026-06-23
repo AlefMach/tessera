@@ -242,14 +242,26 @@ func (s *MemoryStore) SaveFileSummary(ctx context.Context, summary memory.FileSu
 	if err := s.ready(); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO file_summaries (id, session_id, path, summary, hash, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+	imports, err := json.Marshal(summary.Imports)
+	if err != nil {
+		return err
+	}
+	exports, err := json.Marshal(summary.Exports)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO file_summaries (id, session_id, path, language, summary, hash, imports, exports, has_tests_nearby, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(session_id, path) DO UPDATE SET
+			language = excluded.language,
 			summary = excluded.summary,
 			hash = excluded.hash,
+			imports = excluded.imports,
+			exports = excluded.exports,
+			has_tests_nearby = excluded.has_tests_nearby,
 			updated_at = excluded.updated_at
-	`, summary.ID, summary.SessionID, summary.Path, summary.Summary, summary.Hash, summary.UpdatedAt)
+	`, summary.ID, summary.SessionID, summary.Path, summary.Language, summary.Summary, summary.Hash, string(imports), string(exports), summary.HasTestsNearby, summary.UpdatedAt)
 	return err
 }
 
@@ -257,14 +269,14 @@ func (s *MemoryStore) GetFileSummary(ctx context.Context, sessionID, path string
 	if err := s.ready(); err != nil {
 		return memory.FileSummary{}, err
 	}
-	return scanFileSummary(s.db.QueryRowContext(ctx, `SELECT id, session_id, path, summary, hash, updated_at FROM file_summaries WHERE session_id = ? AND path = ?`, sessionID, path))
+	return scanFileSummary(s.db.QueryRowContext(ctx, `SELECT id, session_id, path, language, summary, hash, imports, exports, has_tests_nearby, updated_at FROM file_summaries WHERE session_id = ? AND path = ?`, sessionID, path))
 }
 
 func (s *MemoryStore) ListFileSummaries(ctx context.Context, sessionID string) ([]memory.FileSummary, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, session_id, path, summary, hash, updated_at FROM file_summaries WHERE session_id = ? ORDER BY path`, sessionID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, session_id, path, language, summary, hash, imports, exports, has_tests_nearby, updated_at FROM file_summaries WHERE session_id = ? ORDER BY path`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -286,16 +298,18 @@ func (s *MemoryStore) SaveSymbol(ctx context.Context, symbol memory.Symbol) erro
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO symbols (id, session_id, name, kind, path, line, summary, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO symbols (id, session_id, name, kind, path, line, start_line, end_line, summary, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			kind = excluded.kind,
 			path = excluded.path,
 			line = excluded.line,
+			start_line = excluded.start_line,
+			end_line = excluded.end_line,
 			summary = excluded.summary,
 			updated_at = excluded.updated_at
-	`, symbol.ID, symbol.SessionID, symbol.Name, symbol.Kind, symbol.Path, symbol.Line, symbol.Summary, symbol.UpdatedAt)
+	`, symbol.ID, symbol.SessionID, symbol.Name, symbol.Kind, symbol.Path, symbol.Line, symbol.StartLine, symbol.EndLine, symbol.Summary, symbol.UpdatedAt)
 	return err
 }
 
@@ -303,14 +317,14 @@ func (s *MemoryStore) GetSymbol(ctx context.Context, symbolID string) (memory.Sy
 	if err := s.ready(); err != nil {
 		return memory.Symbol{}, err
 	}
-	return scanSymbol(s.db.QueryRowContext(ctx, `SELECT id, session_id, name, kind, path, line, summary, updated_at FROM symbols WHERE id = ?`, symbolID))
+	return scanSymbol(s.db.QueryRowContext(ctx, `SELECT id, session_id, name, kind, path, line, start_line, end_line, summary, updated_at FROM symbols WHERE id = ?`, symbolID))
 }
 
 func (s *MemoryStore) ListSymbols(ctx context.Context, sessionID string) ([]memory.Symbol, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, session_id, name, kind, path, line, summary, updated_at FROM symbols WHERE session_id = ? ORDER BY path, line, name`, sessionID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, session_id, name, kind, path, line, start_line, end_line, summary, updated_at FROM symbols WHERE session_id = ? ORDER BY path, line, name`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +339,25 @@ func (s *MemoryStore) ListSymbols(ctx context.Context, sessionID string) ([]memo
 		symbols = append(symbols, symbol)
 	}
 	return symbols, rows.Err()
+}
+
+func (s *MemoryStore) ClearIndex(ctx context.Context, sessionID string) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE session_id = ?`, sessionID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_summaries WHERE session_id = ?`, sessionID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *MemoryStore) SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error {
@@ -488,8 +521,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
 			path TEXT NOT NULL,
+			language TEXT NOT NULL DEFAULT '',
 			summary TEXT NOT NULL,
 			hash TEXT NOT NULL,
+			imports TEXT NOT NULL DEFAULT '[]',
+			exports TEXT NOT NULL DEFAULT '[]',
+			has_tests_nearby BOOLEAN NOT NULL DEFAULT 0,
 			updated_at TIMESTAMP NOT NULL,
 			UNIQUE(session_id, path)
 		)`,
@@ -500,6 +537,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			kind TEXT NOT NULL,
 			path TEXT NOT NULL,
 			line INTEGER NOT NULL DEFAULT 0,
+			start_line INTEGER NOT NULL DEFAULT 0,
+			end_line INTEGER NOT NULL DEFAULT 0,
 			summary TEXT NOT NULL,
 			updated_at TIMESTAMP NOT NULL
 		)`,
@@ -522,7 +561,52 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
+	if err := ensureColumn(ctx, db, "file_summaries", "language", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "file_summaries", "imports", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "file_summaries", "exports", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "file_summaries", "has_tests_nearby", "BOOLEAN NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "symbols", "start_line", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "symbols", "end_line", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition)
+	return err
 }
 
 type rowScanner interface {
@@ -569,13 +653,35 @@ func scanObservation(row rowScanner) (memory.Observation, error) {
 
 func scanFileSummary(row rowScanner) (memory.FileSummary, error) {
 	var summary memory.FileSummary
-	err := row.Scan(&summary.ID, &summary.SessionID, &summary.Path, &summary.Summary, &summary.Hash, &summary.UpdatedAt)
+	var imports, exports string
+	err := row.Scan(&summary.ID, &summary.SessionID, &summary.Path, &summary.Language, &summary.Summary, &summary.Hash, &imports, &exports, &summary.HasTestsNearby, &summary.UpdatedAt)
+	if err != nil {
+		return memory.FileSummary{}, err
+	}
+	if imports == "" {
+		imports = "[]"
+	}
+	if exports == "" {
+		exports = "[]"
+	}
+	if err := json.Unmarshal([]byte(imports), &summary.Imports); err != nil {
+		return memory.FileSummary{}, err
+	}
+	if err := json.Unmarshal([]byte(exports), &summary.Exports); err != nil {
+		return memory.FileSummary{}, err
+	}
 	return summary, err
 }
 
 func scanSymbol(row rowScanner) (memory.Symbol, error) {
 	var symbol memory.Symbol
-	err := row.Scan(&symbol.ID, &symbol.SessionID, &symbol.Name, &symbol.Kind, &symbol.Path, &symbol.Line, &symbol.Summary, &symbol.UpdatedAt)
+	err := row.Scan(&symbol.ID, &symbol.SessionID, &symbol.Name, &symbol.Kind, &symbol.Path, &symbol.Line, &symbol.StartLine, &symbol.EndLine, &symbol.Summary, &symbol.UpdatedAt)
+	if symbol.StartLine == 0 {
+		symbol.StartLine = symbol.Line
+	}
+	if symbol.EndLine == 0 {
+		symbol.EndLine = symbol.Line
+	}
 	return symbol, err
 }
 

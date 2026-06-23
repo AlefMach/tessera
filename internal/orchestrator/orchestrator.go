@@ -17,6 +17,7 @@ import (
 	"github.com/alef-mach/tessera/internal/port"
 	"github.com/alef-mach/tessera/internal/project"
 	"github.com/alef-mach/tessera/internal/session"
+	"github.com/alef-mach/tessera/internal/treesitter"
 )
 
 type Orchestrator struct {
@@ -89,6 +90,8 @@ func (o *Orchestrator) interactive(ctx context.Context) error {
 			o.renderStatus(ctx)
 		case "/memory":
 			o.renderMemory(ctx)
+		case "/index":
+			o.renderIndex(ctx)
 		default:
 			run := o.startRun(ctx, input)
 			o.executeLLM(ctx, run, input)
@@ -142,7 +145,7 @@ func (o *Orchestrator) executeLLM(ctx context.Context, run *memory.Run, input st
 }
 
 func (o *Orchestrator) renderHelp(ctx context.Context) {
-	o.emit(ctx, event.New("help", "Commands", "/help    Show available commands\n/status  Show active session status\n/memory  Show saved memory\n/exit    End the session", nil))
+	o.emit(ctx, event.New("help", "Commands", "/help    Show available commands\n/status  Show active session status\n/memory  Show saved memory\n/index   Index project files\n/exit    End the session", nil))
 }
 
 func (o *Orchestrator) renderStatus(ctx context.Context) {
@@ -223,6 +226,27 @@ func (o *Orchestrator) renderMemory(ctx context.Context) {
 	o.emit(ctx, event.New("memory", "Memory", strings.TrimRight(builder.String(), "\n"), map[string]any{
 		"session":      o.session.ID,
 		"observations": len(observations),
+	}))
+}
+
+func (o *Orchestrator) renderIndex(ctx context.Context) {
+	o.emit(ctx, event.New("index.started", "Indexing with Tree-sitter", "", map[string]any{
+		"root": o.session.CWD,
+	}))
+	result, err := treesitter.New(o.session.CWD, o.memory).Index(ctx, o.session.ID)
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "Index failed", err.Error(), map[string]any{"error": err.Error()}))
+		return
+	}
+	message := result.RepoMap
+	if message == "" {
+		message = "No indexable source files found."
+	}
+	o.emit(ctx, event.New("index.finished", "Index finished", message, map[string]any{
+		"files":       result.Files,
+		"symbols":     result.Symbols,
+		"started_at":  result.StartedAt,
+		"finished_at": result.FinishedAt,
 	}))
 }
 

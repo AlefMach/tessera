@@ -107,6 +107,50 @@ func TestStatusIncludesProjectProfile(t *testing.T) {
 	}
 }
 
+func TestIndexSlashCommandPersistsSymbols(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/index\n")
+	writeTestFile(t, filepath.Join(root, "service.go"), "package index\n\nfunc Build() {}\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	ui := &scriptedUI{lines: []string{"/index\n", "/exit\n"}}
+	cfg := config.Config{
+		Provider:   "ollama",
+		Model:      "llama3.2",
+		MaxTokens:  128,
+		TesseraDir: t.TempDir(),
+	}
+
+	orch := New(&fakeLLM{}, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ui.sawEvent("index.finished") {
+		t.Fatalf("expected index.finished event, events=%#v", ui.events)
+	}
+	sess, err := store.GetSession(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbols, err := store.ListSymbols(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(symbols) == 0 || symbols[0].Name != "Build" || symbols[0].StartLine != 3 {
+		t.Fatalf("unexpected symbols: %#v", symbols)
+	}
+}
+
 type fakeLLM struct {
 	requests []llm.GenerateRequest
 	resp     llm.GenerateResponse

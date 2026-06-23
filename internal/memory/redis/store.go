@@ -71,6 +71,9 @@ func (s *MemoryStore) GetSymbol(ctx context.Context, symbolID string) (memory.Sy
 func (s *MemoryStore) ListSymbols(ctx context.Context, sessionID string) ([]memory.Symbol, error) {
 	return nil, ErrNotImplemented
 }
+func (s *MemoryStore) ClearIndex(ctx context.Context, sessionID string) error {
+	return ErrNotImplemented
+}
 func (s *MemoryStore) SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error {
 	return ErrNotImplemented
 }

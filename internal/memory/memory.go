@@ -48,12 +48,16 @@ type Observation struct {
 }
 
 type FileSummary struct {
-	ID        string
-	SessionID string
-	Path      string
-	Summary   string
-	Hash      string
-	UpdatedAt time.Time
+	ID             string
+	SessionID      string
+	Path           string
+	Language       string
+	Summary        string
+	Hash           string
+	Imports        []string
+	Exports        []string
+	HasTestsNearby bool
+	UpdatedAt      time.Time
 }
 
 type Symbol struct {
@@ -63,6 +67,8 @@ type Symbol struct {
 	Kind      string
 	Path      string
 	Line      int
+	StartLine int
+	EndLine   int
 	Summary   string
 	UpdatedAt time.Time
 }
@@ -99,6 +105,7 @@ type Store interface {
 	SaveSymbol(ctx context.Context, symbol Symbol) error
 	GetSymbol(ctx context.Context, symbolID string) (Symbol, error)
 	ListSymbols(ctx context.Context, sessionID string) ([]Symbol, error)
+	ClearIndex(ctx context.Context, sessionID string) error
 	SaveProjectProfile(ctx context.Context, profile project.ProjectProfile) error
 	GetProjectProfile(ctx context.Context, sessionID string) (project.ProjectProfile, error)
 	SaveEvent(ctx context.Context, sessionID string, evt event.Event) error
