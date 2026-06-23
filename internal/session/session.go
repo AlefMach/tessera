@@ -22,3 +22,7 @@ func New(id, cwd, provider, model string) Session {
 		UpdatedAt: now,
 	}
 }
+
+func makeID() string {
+	return "sess-" + time.Now().UTC().Format("20060102-150405")
+}

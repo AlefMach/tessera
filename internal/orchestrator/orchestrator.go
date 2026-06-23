@@ -11,17 +11,20 @@ import (
 
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
+	"github.com/alef-mach/tessera/internal/memory"
 	"github.com/alef-mach/tessera/internal/port"
 	"github.com/alef-mach/tessera/internal/session"
 )
 
 type Orchestrator struct {
-	llm      port.LLM
-	memory   port.MemoryStore
-	ui       port.UIRenderer
-	executor port.ToolExecutor
-	config   config.Config
-	session  session.Session
+	llm       port.LLM
+	memory    port.MemoryStore
+	ui        port.UIRenderer
+	executor  port.ToolExecutor
+	config    config.Config
+	session   session.Session
+	manager   *session.Manager
+	activeRun *memory.Run
 }
 
 func New(llm port.LLM, memory port.MemoryStore, ui port.UIRenderer, executor port.ToolExecutor, cfg config.Config) *Orchestrator {
@@ -32,20 +35,16 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	if err := o.memory.Ensure(ctx); err != nil {
 		return err
 	}
-
-	cwd, err := os.Getwd()
+	o.manager = session.NewManager(o.memory)
+	sess, err := o.manager.Start(ctx, o.config.Provider, o.config.Model)
 	if err != nil {
 		return err
 	}
-
-	o.session = session.New(makeSessionID(), cwd, o.config.Provider, o.config.Model)
-	if err := o.memory.SaveSession(ctx, o.session); err != nil {
-		return err
-	}
+	o.session = sess
 
 	o.emit(ctx, event.New("session.started", "Session started", "Type your task or /help.", map[string]any{
 		"session_id":     o.session.ID,
-		"cwd":            cwd,
+		"cwd":            o.session.CWD,
 		"provider":       o.config.Provider,
 		"model":          o.config.Model,
 		"context_tokens": o.config.ContextTokens,
@@ -82,16 +81,103 @@ func (o *Orchestrator) interactive(ctx context.Context) error {
 			return nil
 		case "/help":
 			o.renderHelp(ctx)
+		case "/status":
+			o.renderStatus(ctx)
+		case "/memory":
+			o.renderMemory(ctx)
 		default:
+			run := o.startRun(ctx, input)
 			o.emit(ctx, event.New("task.received", "Task received", "LLM execution is not implemented in Milestone 0.", map[string]any{
 				"input": input,
 			}))
+			o.finishRun(ctx, run)
 		}
 	}
 }
 
 func (o *Orchestrator) renderHelp(ctx context.Context) {
-	o.emit(ctx, event.New("help", "Commands", "/help  Show available commands\n/exit  End the session", nil))
+	o.emit(ctx, event.New("help", "Commands", "/help    Show available commands\n/status  Show active session status\n/memory  Show saved memory\n/exit    End the session", nil))
+}
+
+func (o *Orchestrator) renderStatus(ctx context.Context) {
+	stats, err := o.memory.Stats(ctx, o.session.ID)
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "Status unavailable", err.Error(), map[string]any{"error": err.Error()}))
+		return
+	}
+	o.emit(ctx, event.New("status", "Status", "", map[string]any{
+		"session":      stats.SessionID,
+		"provider":     stats.Provider,
+		"model":        stats.Model,
+		"calls":        stats.Calls,
+		"steps":        stats.Steps,
+		"runs":         stats.Runs,
+		"observations": stats.Observations,
+	}))
+}
+
+func (o *Orchestrator) renderMemory(ctx context.Context) {
+	observations, err := o.memory.ListObservations(ctx, o.session.ID)
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "Memory unavailable", err.Error(), map[string]any{"error": err.Error()}))
+		return
+	}
+	var builder strings.Builder
+	limit := min(len(observations), 12)
+	for i := 0; i < limit; i++ {
+		observation := observations[i]
+		builder.WriteString("- ")
+		builder.WriteString(observation.CreatedAt.Local().Format("15:04:05"))
+		builder.WriteString(" ")
+		builder.WriteString(observation.Kind)
+		builder.WriteString(" ")
+		builder.WriteString(oneLine(observation.Content))
+		builder.WriteString("\n")
+	}
+	if limit == 0 {
+		builder.WriteString("No saved observations yet.")
+	}
+	o.emit(ctx, event.New("memory", "Memory", strings.TrimRight(builder.String(), "\n"), map[string]any{
+		"session":      o.session.ID,
+		"observations": len(observations),
+	}))
+}
+
+func (o *Orchestrator) startRun(ctx context.Context, input string) *memory.Run {
+	now := time.Now().UTC()
+	run := &memory.Run{
+		ID:        "run-" + now.Format("20060102-150405.000000000"),
+		SessionID: o.session.ID,
+		Input:     input,
+		Status:    "running",
+		Steps:     1,
+		StartedAt: now,
+		UpdatedAt: now,
+	}
+	if err := o.memory.SaveRun(ctx, *run); err != nil {
+		o.emit(ctx, event.New("error.occurred", "Run not saved", err.Error(), map[string]any{"error": err.Error()}))
+		return nil
+	}
+	o.activeRun = run
+	return run
+}
+
+func oneLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func (o *Orchestrator) finishRun(ctx context.Context, run *memory.Run) {
+	if run == nil {
+		return
+	}
+	now := time.Now().UTC()
+	run.Status = "finished"
+	run.UpdatedAt = now
+	run.EndedAt = &now
+	if err := o.memory.SaveRun(ctx, *run); err != nil {
+		o.emit(ctx, event.New("error.occurred", "Run not saved", err.Error(), map[string]any{"error": err.Error()}))
+	}
+	o.activeRun = nil
 }
 
 func (o *Orchestrator) emit(ctx context.Context, evt event.Event) {
@@ -99,10 +185,6 @@ func (o *Orchestrator) emit(ctx context.Context, evt event.Event) {
 	if o.session.ID != "" {
 		_ = o.memory.SaveEvent(ctx, o.session.ID, evt)
 	}
-}
-
-func makeSessionID() string {
-	return "sess-" + time.Now().UTC().Format("20060102-150405")
 }
 
 func appendHistory(path, input string) {

@@ -10,9 +10,9 @@ import (
 
 	"github.com/alef-mach/tessera/internal/adapter/executor/localexec"
 	"github.com/alef-mach/tessera/internal/adapter/llm/ollama"
-	"github.com/alef-mach/tessera/internal/adapter/memory/sqlite"
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
+	"github.com/alef-mach/tessera/internal/memory/sqlite"
 	"github.com/alef-mach/tessera/internal/orchestrator"
 	"github.com/alef-mach/tessera/internal/trust"
 	"github.com/alef-mach/tessera/internal/ui/plain"
@@ -115,7 +115,7 @@ func runInteractive(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	memory := sqlite.NewMemoryStore(cfg.SQLitePath, cfg.TesseraDir)
+	memory := sqlite.NewMemoryStore(cfg.SQLitePath)
 	llm := ollama.NewLLM(cfg.OllamaURL, cfg.Model)
 	executor := localexec.NewExecutor()
 
