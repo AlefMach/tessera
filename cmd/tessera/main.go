@@ -11,11 +11,11 @@ import (
 	"github.com/alef-mach/tessera/internal/adapter/executor/localexec"
 	"github.com/alef-mach/tessera/internal/adapter/llm/ollama"
 	"github.com/alef-mach/tessera/internal/adapter/memory/sqlite"
-	"github.com/alef-mach/tessera/internal/adapter/ui/plain"
 	"github.com/alef-mach/tessera/internal/config"
 	"github.com/alef-mach/tessera/internal/event"
 	"github.com/alef-mach/tessera/internal/orchestrator"
 	"github.com/alef-mach/tessera/internal/trust"
+	"github.com/alef-mach/tessera/internal/ui/plain"
 )
 
 func main() {

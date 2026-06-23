@@ -44,8 +44,13 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	}
 
 	o.emit(ctx, event.New("session.started", "Session started", "Type your task or /help.", map[string]any{
-		"session_id": o.session.ID,
-		"cwd":        cwd,
+		"session_id":     o.session.ID,
+		"cwd":            cwd,
+		"provider":       o.config.Provider,
+		"model":          o.config.Model,
+		"context_tokens": o.config.ContextTokens,
+		"max_tokens":     o.config.MaxTokens,
+		"calls":          0,
 	}))
 
 	return o.interactive(ctx)
