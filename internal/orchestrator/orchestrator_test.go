@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -175,8 +176,9 @@ func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
-		resp: llm.GenerateResponse{
-			Text: `{"action":"run_command","message":"Run the focused Go tests.","command":{"name":"go","args":["test","./..."],"reason":"Verify the current project."}}`,
+		resps: []llm.GenerateResponse{
+			{Text: `{"action":"run_command","message":"Run the focused Go tests.","command":{"name":"go","args":["test","./..."],"reason":"Verify the current project."}}`},
+			{Text: `{"action":"answer","message":"Tests passed. No code changes are needed."}`},
 		},
 	}
 	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
@@ -206,16 +208,78 @@ func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 	if !ui.sawEvent("test.finished") {
 		t.Fatalf("expected command result event, events=%#v", ui.events)
 	}
+	if len(model.requests) != 2 {
+		t.Fatalf("expected Tessera to continue after command output, got %d LLM calls", len(model.requests))
+	}
+	if !strings.Contains(model.requests[1].Prompt, "command.result") || !strings.Contains(model.requests[1].Prompt, "ok") {
+		t.Fatalf("expected second prompt to include command result, got:\n%s", model.requests[1].Prompt)
+	}
+}
+
+func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/patch\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	patch := "diff --git a/hello.txt b/hello.txt\nnew file mode 100644\nindex 0000000..ce01362\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hello\n"
+	model := &fakeLLM{
+		resps: []llm.GenerateResponse{
+			{Text: `{"action":"propose_patch","message":"Create hello.txt.","files":["hello.txt"],"patch":` + strconv.Quote(patch) + `}`},
+			{Text: `{"action":"answer","message":"Patch applied."}`},
+		},
+	}
+	exec := &fakeExecutor{out: port.Output{Stdout: ""}}
+	ui := &scriptedUI{lines: []string{"crie hello\n", "/exit\n"}}
+	cfg := config.Config{
+		Provider:   "ollama",
+		Model:      "llama3.2",
+		MaxTokens:  128,
+		TesseraDir: t.TempDir(),
+	}
+
+	orch := New(model, store, ui, exec, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(exec.commands) != 1 {
+		t.Fatalf("expected one patch apply command, got %#v", exec.commands)
+	}
+	got := exec.commands[0]
+	if got.Name != "git" || len(got.Args) != 3 || got.Args[0] != "apply" || got.Dir != root {
+		t.Fatalf("unexpected patch command: %#v", got)
+	}
+	if !ui.sawEvent("approval.requested") || !ui.sawEvent("patch.applied") {
+		t.Fatalf("expected patch approval and applied events, got %#v", ui.events)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("expected Tessera to continue after applying patch, got %d LLM calls", len(model.requests))
+	}
 }
 
 type fakeLLM struct {
 	requests []llm.GenerateRequest
+	resps    []llm.GenerateResponse
 	resp     llm.GenerateResponse
 	err      error
 }
 
 func (f *fakeLLM) Generate(ctx context.Context, req llm.GenerateRequest) (llm.GenerateResponse, error) {
 	f.requests = append(f.requests, req)
+	if len(f.resps) > 0 {
+		resp := f.resps[0]
+		f.resps = f.resps[1:]
+		return resp, f.err
+	}
 	return f.resp, f.err
 }
 

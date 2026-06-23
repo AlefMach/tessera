@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,11 +27,47 @@ type commandAction struct {
 	Reason string   `json:"reason"`
 }
 
-func (o *Orchestrator) handleModelResponse(ctx context.Context, run *memory.Run, text string) {
+func (a *modelAction) UnmarshalJSON(data []byte) error {
+	type actionAlias struct {
+		Action  string          `json:"action"`
+		Message string          `json:"message"`
+		Command commandAction   `json:"command"`
+		Patch   string          `json:"patch"`
+		Files   json.RawMessage `json:"files"`
+	}
+	var raw actionAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	a.Action = raw.Action
+	a.Message = raw.Message
+	a.Command = raw.Command
+	a.Patch = raw.Patch
+	a.Files = parseStringList(raw.Files)
+	return nil
+}
+
+func (c *commandAction) UnmarshalJSON(data []byte) error {
+	type commandAlias struct {
+		Name   string          `json:"name"`
+		Args   json.RawMessage `json:"args"`
+		Reason string          `json:"reason"`
+	}
+	var raw commandAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.Name = raw.Name
+	c.Args = parseStringList(raw.Args)
+	c.Reason = raw.Reason
+	return nil
+}
+
+func (o *Orchestrator) handleModelResponse(ctx context.Context, run *memory.Run, text string) bool {
 	action, ok := parseModelAction(text)
 	if !ok {
 		o.saveObservation(ctx, run, "model.answer", strings.TrimSpace(text), nil)
-		return
+		return false
 	}
 	if action.Message != "" {
 		o.saveObservation(ctx, run, "model."+firstNonEmpty(action.Action, "answer"), action.Message, nil)
@@ -37,40 +75,42 @@ func (o *Orchestrator) handleModelResponse(ctx context.Context, run *memory.Run,
 
 	switch action.Action {
 	case "", "answer":
-		return
+		return false
 	case "run_command":
-		o.handleRunCommand(ctx, run, action)
+		return o.handleRunCommand(ctx, run, action)
 	case "propose_patch":
-		o.handleProposedPatch(ctx, run, action)
+		return o.handleProposedPatch(ctx, run, action)
 	case "suggest_commit_message":
 		o.emit(ctx, event.New("commit.message.suggested", "Suggested commit message", action.Message, map[string]any{
 			"run_id": runID(run),
 		}))
+		return false
 	default:
 		o.emit(ctx, event.New("run.aborted", "Unsupported model action", action.Message, map[string]any{
 			"action": action.Action,
 			"run_id": runID(run),
 		}))
+		return false
 	}
 }
 
-func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, action modelAction) {
+func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, action modelAction) bool {
 	if o.executor == nil {
 		o.emit(ctx, event.New("error.occurred", "Command unavailable", "No command executor is configured.", map[string]any{"run_id": runID(run)}))
-		return
+		return false
 	}
 	name := strings.TrimSpace(action.Command.Name)
 	args := cleanArgs(action.Command.Args)
 	if name == "" {
 		o.emit(ctx, event.New("run.aborted", "Command rejected", "The model did not provide a command name.", map[string]any{"run_id": runID(run)}))
-		return
+		return false
 	}
 	if reason := commandRisk(name, args); reason != "" {
 		o.emit(ctx, event.New("run.aborted", "Command blocked", reason, map[string]any{
 			"command": commandString(name, args),
 			"run_id":  runID(run),
 		}))
-		return
+		return false
 	}
 
 	commandText := commandString(name, args)
@@ -81,7 +121,7 @@ func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, ac
 	}))
 	if !approved {
 		o.emit(ctx, event.New("run.aborted", "Command denied", commandText, map[string]any{"run_id": runID(run)}))
-		return
+		return false
 	}
 
 	started := time.Now()
@@ -115,9 +155,10 @@ func (o *Orchestrator) handleRunCommand(ctx context.Context, run *memory.Run, ac
 		"status":    status,
 		"exit_code": out.ExitCode,
 	})
+	return true
 }
 
-func (o *Orchestrator) handleProposedPatch(ctx context.Context, run *memory.Run, action modelAction) {
+func (o *Orchestrator) handleProposedPatch(ctx context.Context, run *memory.Run, action modelAction) bool {
 	o.emit(ctx, event.New("patch.proposed", "Patch proposed", action.Message, map[string]any{
 		"files":  action.Files,
 		"patch":  action.Patch,
@@ -127,6 +168,64 @@ func (o *Orchestrator) handleProposedPatch(ctx context.Context, run *memory.Run,
 		"files": action.Files,
 		"patch": action.Patch,
 	})
+	if strings.TrimSpace(action.Patch) == "" {
+		o.emit(ctx, event.New("run.aborted", "Patch rejected", "The model did not provide a patch.", map[string]any{"run_id": runID(run)}))
+		return false
+	}
+	if o.executor == nil {
+		o.emit(ctx, event.New("error.occurred", "Patch unavailable", "No command executor is configured.", map[string]any{"run_id": runID(run)}))
+		return false
+	}
+
+	approved := o.ui.AskApproval(event.New("approval.requested", "Apply patch?", action.Message, map[string]any{
+		"files":  action.Files,
+		"patch":  action.Patch,
+		"risk":   "workspace file changes",
+		"run_id": runID(run),
+	}))
+	if !approved {
+		o.emit(ctx, event.New("run.aborted", "Patch denied", "No files were changed.", map[string]any{"run_id": runID(run)}))
+		return false
+	}
+
+	patchPath, err := o.writePatchFile(run, action.Patch)
+	if err != nil {
+		o.emit(ctx, event.New("error.occurred", "Patch not saved", err.Error(), map[string]any{"error": err.Error(), "run_id": runID(run)}))
+		return false
+	}
+	out, err := o.executor.Run(ctx, port.Command{
+		Name:    "git",
+		Args:    []string{"apply", "--whitespace=nowarn", patchPath},
+		Dir:     o.session.CWD,
+		Timeout: 30 * time.Second,
+	})
+	output := strings.TrimSpace(strings.Join([]string{out.Stdout, out.Stderr}, "\n"))
+	if err != nil || out.ExitCode != 0 {
+		if output == "" && err != nil {
+			output = err.Error()
+		}
+		o.emit(ctx, event.New("run.aborted", "Patch failed", output, map[string]any{
+			"patch_file": patchPath,
+			"exit_code":  out.ExitCode,
+			"run_id":     runID(run),
+		}))
+		o.saveObservation(ctx, run, "patch.failed", output, map[string]any{
+			"patch_file": patchPath,
+			"exit_code":  out.ExitCode,
+		})
+		return true
+	}
+
+	o.emit(ctx, event.New("patch.applied", "Patch applied", strings.TrimSpace(action.Message), map[string]any{
+		"files":      action.Files,
+		"patch_file": patchPath,
+		"run_id":     runID(run),
+	}))
+	o.saveObservation(ctx, run, "patch.applied", strings.TrimSpace(action.Message), map[string]any{
+		"files":      action.Files,
+		"patch_file": patchPath,
+	})
+	return true
 }
 
 func parseModelAction(text string) (modelAction, bool) {
@@ -176,6 +275,37 @@ func cleanArgs(args []string) []string {
 		}
 	}
 	return out
+}
+
+func parseStringList(raw json.RawMessage) []string {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err == nil {
+		return cleanArgs(values)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return strings.Fields(value)
+	}
+	return nil
+}
+
+func (o *Orchestrator) writePatchFile(run *memory.Run, patch string) (string, error) {
+	dir := filepath.Join(o.config.TesseraDir, "runs", firstNonEmpty(runID(run), "ad-hoc"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "latest.patch")
+	if !strings.HasSuffix(patch, "\n") {
+		patch += "\n"
+	}
+	if err := os.WriteFile(path, []byte(patch), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func commandString(name string, args []string) string {

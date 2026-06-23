@@ -22,7 +22,7 @@ Respond with exactly one JSON object, like this:
   "message": "short explanation for the user",
   "command": {"name": "which language", "args": "which command", "reason": "why this command is useful"},
   "patch": "unified diff when action is propose_patch",
-  "files": "which files are affected by the patch",
+  "files": ["which files are affected by the patch"],
 }
 
 Use "answer" when more inspection or a human decision is needed. Use "run_command" only for local project commands that help inspect or verify. Use "propose_patch" when you can produce a small unified diff.`
@@ -68,6 +68,7 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, input string) string {
 	b.WriteString("- Keep the next step small.\n")
 	b.WriteString("- If proposing a file change, return a unified diff and do not assume it was applied.\n")
 	b.WriteString("- If running a command, return a JSON command object; Tessera will ask the user for approval.\n")
+	b.WriteString("- After a command result or applied patch appears in memory, continue solving the task instead of only telling the user to run the command.\n")
 	b.WriteString("- If existing user changes are present, mention that before proposing edits.\n")
 
 	return truncateMiddle(b.String(), o.promptCharBudget())
