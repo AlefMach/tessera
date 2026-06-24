@@ -19,6 +19,7 @@ You MUST respond with ONLY valid JSON — no markdown, no explanation outside th
 Available action types:
 - "inspect": read specific files to understand the codebase before making changes
 - "patch": apply a unified diff to create or modify files
+- "write": write the complete final content of one workspace file
 - "run": execute a local verification command (tests, build, etc.)
 - "finish": mark the task as complete with a summary
 - "blocker": report when something prevents safe progress
@@ -26,15 +27,17 @@ Available action types:
 Rules:
 - Always inspect relevant files BEFORE writing patches — do not guess file content
 - When creating a new file, use patch with a unified diff (--- /dev/null header)
+- If generating a correct unified diff is difficult, use "write" with the complete final file content instead
 - After a run succeeds (exit_code 0), prefer "finish" unless there is still failing work
 - Never commit, push, rewrite git history, or install global tools unless explicitly asked
-- Do not claim changes were made unless a patch action was actually approved and applied
+- Do not claim changes were made unless a patch or write action was actually approved and applied
 - Keep patches small and focused — one logical change at a time
 - If you do not have enough context, use "inspect" first
 
 JSON shape (use exactly one):
 {"type":"inspect","reason":"...","files":["path/to/file"]}
 {"type":"patch","reason":"...","patch":"--- a/file\n+++ b/file\n@@ ... @@\n..."}
+{"type":"write","reason":"...","path":"path/to/file","content":"complete final file content\n"}
 {"type":"run","reason":"...","command":"go test ./..."}
 {"type":"finish","summary":"..."}
 {"type":"blocker","reason":"..."}`
@@ -47,7 +50,7 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 
 	var b strings.Builder
 
-	b.WriteString("# Task\n")
+	b.WriteString("# User task\n")
 	b.WriteString(task)
 	b.WriteString("\n")
 
@@ -57,7 +60,7 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n# Project\n")
+	b.WriteString("\n# Project profile\n")
 	fmt.Fprintf(&b, "- root: %s\n", profile.Root)
 	fmt.Fprintf(&b, "- stack: %s\n", profile.Stack)
 	fmt.Fprintf(&b, "- mode: %s\n", profile.Mode)
@@ -91,11 +94,12 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n# Instructions\n")
+	b.WriteString("\n# Constraints\n")
 	b.WriteString("- Respond with ONLY valid JSON, no other text.\n")
-	b.WriteString("- Choose exactly ONE action type: inspect, patch, run, finish, or blocker.\n")
+	b.WriteString("- Choose exactly ONE action type: inspect, patch, write, run, finish, or blocker.\n")
 	b.WriteString("- Use inspect when you need to read a file before editing it.\n")
 	b.WriteString("- Use patch to create or modify files (unified diff format).\n")
+	b.WriteString("- Use write when you know the complete final content for one file and a unified diff is likely to fail.\n")
 	b.WriteString("- Use run for tests or build commands — Tessera will ask for approval first.\n")
 	b.WriteString("- Use finish when the task is complete.\n")
 	b.WriteString("- Use blocker when you cannot proceed safely.\n")
@@ -103,6 +107,8 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 	b.WriteString(`{"type":"inspect","reason":"Need to see the existing test structure before writing a new test.","files":["internal/sum/sum_test.go","internal/sum/sum.go"]}`)
 	b.WriteString("\n")
 	b.WriteString(`{"type":"patch","reason":"Create the first unit test for sum.go.","patch":"--- /dev/null\n+++ b/internal/sum/sum_test.go\n@@ -0,0 +1,12 @@\n+package sum_test\n+\n+import (\n+\t\"testing\"\n+\t\"github.com/example/project/internal/sum\"\n+)\n+\n+func TestAdd(t *testing.T) {\n+\tif got := sum.Add(1, 2); got != 3 {\n+\t\tt.Errorf(\"Add(1,2) = %d, want 3\", got)\n+\t}\n+}"}`)
+	b.WriteString("\n")
+	b.WriteString(`{"type":"write","reason":"Replace the file with the corrected implementation.","path":"internal/sum/sum.go","content":"package sum\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"}`)
 	b.WriteString("\n")
 	b.WriteString(`{"type":"run","reason":"Run the tests to verify the new test file passes.","command":"go test ./..."}`)
 	b.WriteString("\n")
@@ -293,7 +299,7 @@ func appendInvalidActionRepairPrompt(prompt string, previousResponse string, pre
 		b.WriteString(previousResponse)
 		b.WriteString("\n")
 	}
-	b.WriteString(`Expected shape: {"type":"inspect|patch|run|finish|blocker","reason":"...","files":[...],"patch":"...","command":"...","summary":"..."}`)
+	b.WriteString(`Expected shape: {"type":"inspect|patch|write|run|finish|blocker","reason":"...","files":[...],"path":"...","content":"...","patch":"...","command":"...","summary":"..."}`)
 	b.WriteString("\n")
 	return b.String()
 }
@@ -317,5 +323,3 @@ func limitStrings(values []string, limit int) []string {
 	out = append(out, fmt.Sprintf("... %d more", len(values)-limit))
 	return out
 }
-
-

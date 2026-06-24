@@ -272,6 +272,54 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	}
 }
 
+func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/write\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{
+		resps: []llm.GenerateResponse{
+			{Text: `{"type":"write","reason":"Create hello.txt.","path":"hello.txt","content":"hello\n"}`},
+			{Text: `{"type":"finish","summary":"File written."}`},
+		},
+	}
+	ui := &scriptedUI{lines: []string{"escreva hello\n", "/exit\n"}}
+	cfg := config.Config{
+		Provider:   "ollama",
+		Model:      "llama3.2",
+		MaxTokens:  128,
+		TesseraDir: t.TempDir(),
+	}
+
+	orch := New(model, store, ui, nil, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello\n" {
+		t.Fatalf("unexpected file content: %q", got)
+	}
+	if !ui.sawEvent("approval.requested") || !ui.sawEvent("write.applied") {
+		t.Fatalf("expected write approval and applied events, got %#v", ui.events)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("expected Tessera to continue after writing file, got %d LLM calls", len(model.requests))
+	}
+}
+
 func TestBlockerActionFailsRun(t *testing.T) {
 	ctx := context.Background()
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
@@ -427,6 +475,7 @@ func TestModelActionValidationRejectsIncompleteActions(t *testing.T) {
 	tests := []ModelAction{
 		{Type: ActionInspect},
 		{Type: ActionPatch},
+		{Type: ActionWrite},
 		{Type: ActionRun},
 		{Type: ActionFinish},
 		{Type: ActionBlocker},

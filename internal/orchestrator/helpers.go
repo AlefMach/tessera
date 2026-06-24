@@ -35,3 +35,7 @@ func isSuccessfulRunResult(result string) bool {
 func isSuccessfulPatchResult(result string) bool {
 	return strings.Contains(strings.ToLower(result), "patch_status: applied")
 }
+
+func isSuccessfulWriteResult(result string) bool {
+	return strings.Contains(strings.ToLower(result), "write_status: applied")
+}

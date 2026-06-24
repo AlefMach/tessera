@@ -22,6 +22,7 @@ type ActionType string
 const (
 	ActionInspect ActionType = "inspect"
 	ActionPatch   ActionType = "patch"
+	ActionWrite   ActionType = "write"
 	ActionRun     ActionType = "run"
 	ActionFinish  ActionType = "finish"
 	ActionBlocker ActionType = "blocker"
@@ -31,6 +32,8 @@ type ModelAction struct {
 	Type    ActionType `json:"type"`
 	Reason  string     `json:"reason,omitempty"`
 	Files   []string   `json:"files,omitempty"`
+	Path    string     `json:"path,omitempty"`
+	Content string     `json:"content,omitempty"`
 	Patch   string     `json:"patch,omitempty"`
 	Command string     `json:"command,omitempty"`
 	Summary string     `json:"summary,omitempty"`
@@ -45,6 +48,13 @@ func (a ModelAction) Validate() error {
 	case ActionPatch:
 		if strings.TrimSpace(a.Patch) == "" {
 			return errors.New("patch action requires a non-empty patch")
+		}
+	case ActionWrite:
+		if strings.TrimSpace(a.Path) == "" && len(a.Files) != 1 {
+			return errors.New("write action requires path or exactly one file")
+		}
+		if a.Content == "" {
+			return errors.New("write action requires non-empty content")
 		}
 	case ActionRun:
 		if strings.TrimSpace(a.Command) == "" {
@@ -74,6 +84,8 @@ func (o *Orchestrator) executeModelAction(ctx context.Context, run *memory.Run, 
 		return o.executeInspect(ctx, run, action)
 	case ActionPatch:
 		return o.executePatch(ctx, run, action)
+	case ActionWrite:
+		return o.executeWrite(ctx, run, action)
 	case ActionRun:
 		return o.executeRun(ctx, run, action)
 	case ActionFinish:
@@ -118,9 +130,9 @@ func (o *Orchestrator) executeInspect(ctx context.Context, run *memory.Run, acti
 }
 
 func (o *Orchestrator) readWorkspaceFile(rel string) (string, error) {
-	clean := filepath.Clean(filepath.FromSlash(rel))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
-		return "", fmt.Errorf("path outside workspace is not allowed: %s", rel)
+	clean, err := cleanWorkspaceRelPath(rel)
+	if err != nil {
+		return "", err
 	}
 	if isSensitiveWorkspacePath(clean) {
 		return "", fmt.Errorf("sensitive file is not inspectable by default: %s", rel)
@@ -173,6 +185,14 @@ func isSensitiveWorkspacePath(path string) bool {
 		strings.HasSuffix(base, ".key") ||
 		strings.HasSuffix(base, ".p12") ||
 		strings.HasSuffix(base, ".pfx")
+}
+
+func cleanWorkspaceRelPath(rel string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(rel)))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path outside workspace is not allowed: %s", rel)
+	}
+	return clean, nil
 }
 
 func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
@@ -253,6 +273,77 @@ func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action
 	return result, false, nil
 }
 
+func (o *Orchestrator) executeWrite(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
+	rel := strings.TrimSpace(action.Path)
+	if rel == "" && len(action.Files) == 1 {
+		rel = action.Files[0]
+	}
+	clean, err := cleanWorkspaceRelPath(rel)
+	if err != nil {
+		return "", false, err
+	}
+	if isSensitiveWorkspacePath(clean) {
+		return "", false, fmt.Errorf("sensitive file is not writable by default: %s", rel)
+	}
+
+	existing, readErr := o.readWorkspaceFile(clean)
+	fileExists := readErr == nil
+	diff := writePreviewDiff(clean, existing, action.Content, fileExists)
+	message := action.Reason
+	gitStatus := ""
+	if o.executor != nil {
+		gitStatus = o.gitStatus(ctx)
+	}
+	if isDirtyGitStatus(gitStatus) {
+		message = firstNonEmpty(message, "Review this write before applying it.") + "\n\nWarning: the working tree already has changes. Review carefully so user changes are not overwritten."
+	}
+
+	o.emit(ctx, event.New("write.proposed", "Write proposed", message, map[string]any{
+		"files":      []string{filepath.ToSlash(clean)},
+		"diff":       diff,
+		"git_status": gitStatus,
+		"run_id":     runID(run),
+	}))
+	o.saveObservation(ctx, run, "write.proposed", action.Reason, map[string]any{
+		"files":      []string{filepath.ToSlash(clean)},
+		"diff":       diff,
+		"git_status": gitStatus,
+	})
+
+	approved := o.ui.AskApproval(event.New("approval.requested", "Write file?", message, map[string]any{
+		"files":      []string{filepath.ToSlash(clean)},
+		"diff":       diff,
+		"git_status": gitStatus,
+		"risk":       "workspace file changes",
+		"run_id":     runID(run),
+	}))
+	if !approved {
+		return "write denied by user", false, errors.New("write denied by user")
+	}
+
+	path := filepath.Join(o.session.CWD, clean)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", false, fmt.Errorf("create parent directory: %w", err)
+	}
+	content := action.Content
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", false, fmt.Errorf("write file: %w", err)
+	}
+
+	result := fmt.Sprintf("write_status: applied\nfile_changed: %s", filepath.ToSlash(clean))
+	o.emit(ctx, event.New("write.applied", "Write applied", strings.TrimSpace(action.Reason), map[string]any{
+		"files":  []string{filepath.ToSlash(clean)},
+		"run_id": runID(run),
+	}))
+	o.saveObservation(ctx, run, "write.applied", result, map[string]any{
+		"files": []string{filepath.ToSlash(clean)},
+	})
+	return result, false, nil
+}
+
 func (o *Orchestrator) executeRun(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
 	if o.executor == nil {
 		return "", false, errors.New("command unavailable: no command executor is configured")
@@ -326,6 +417,7 @@ func parseModelAction(text string) (ModelAction, error) {
 	}
 	action.Type = ActionType(strings.TrimSpace(strings.ToLower(string(action.Type))))
 	action.Reason = strings.TrimSpace(action.Reason)
+	action.Path = strings.TrimSpace(action.Path)
 	action.Patch = strings.TrimSpace(action.Patch)
 	action.Command = strings.TrimSpace(action.Command)
 	action.Summary = strings.TrimSpace(action.Summary)
@@ -334,6 +426,30 @@ func parseModelAction(text string) (ModelAction, error) {
 		return ModelAction{}, err
 	}
 	return action, nil
+}
+
+func writePreviewDiff(path, oldContent, newContent string, fileExists bool) string {
+	oldPath := "a/" + filepath.ToSlash(path)
+	if !fileExists {
+		oldPath = "/dev/null"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "--- %s\n", oldPath)
+	fmt.Fprintf(&b, "+++ b/%s\n", filepath.ToSlash(path))
+	b.WriteString("@@\n")
+	if fileExists {
+		for _, line := range strings.Split(strings.TrimSuffix(oldContent, "\n"), "\n") {
+			if line != "" {
+				fmt.Fprintf(&b, "-%s\n", line)
+			}
+		}
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(newContent, "\n"), "\n") {
+		if line != "" {
+			fmt.Fprintf(&b, "+%s\n", line)
+		}
+	}
+	return b.String()
 }
 
 func extractJSON(text string) string {

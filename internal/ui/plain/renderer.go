@@ -93,7 +93,7 @@ func (r *Renderer) RenderEvent(evt event.Event) {
 		r.renderCommandProposed(evt)
 	case "approval.requested", "workspace.trust.requested":
 		r.renderApprovalRequested(evt)
-	case "patch.proposed":
+	case "patch.proposed", "write.proposed":
 		r.renderPatchProposed(evt)
 	case "test.started", "test.finished":
 		r.renderTest(evt)
@@ -191,6 +191,9 @@ func (r *Renderer) renderPatchProposed(evt event.Event) {
 	r.writeTitle("±", titleOr(evt, "Patch proposed"), evt.Timestamp)
 	r.writeMarkdown(evt.Message)
 	r.writeKnownData(evt.Data, "files", "summary", "git_status")
+	if diff := dataString(evt.Data, "diff", "patch"); diff != "" {
+		r.writeBlock(renderDiff(diff, r.diffStyles))
+	}
 	r.blank()
 }
 

@@ -56,8 +56,8 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 		}
 
 		switch action.Type {
-		case ActionPatch:
-			if isSuccessfulPatchResult(result) {
+		case ActionPatch, ActionWrite:
+			if isSuccessfulPatchResult(result) || isSuccessfulWriteResult(result) {
 				patchesAppliedSinceLastRun = true
 				successfulRunActions = 0
 			}
