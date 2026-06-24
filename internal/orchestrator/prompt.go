@@ -26,12 +26,19 @@ Available action types:
 
 Rules:
 - Always inspect relevant files BEFORE writing patches — do not guess file content
+- If the user explicitly asks to change, edit, rewrite, improve, or refactor a file, treat that as an implementation task; do not finish with "nothing to change" before applying a focused patch or write
+- Missing unit tests are NOT a blocker for requested code changes or refactors; make the requested edit, then verify with the closest available local check
 - When creating a new file, use patch with a unified diff (--- /dev/null header)
 - If generating a correct unified diff is difficult, use "write" with the complete final file content instead
-- After a run succeeds (exit_code 0), prefer "finish" unless there is still failing work
+- After applying a patch or write, run the narrowest relevant verification command before finishing
+- Prefer tests for the changed file's package or directory first; for Go, use commands such as "go test ./cmd/tessera" for a change under cmd/tessera
+- If no dedicated test exists for the changed file, run the closest package tests, project test command, build command, type check, or another local verification
+- If verification fails, summarize the failing command and relevant error; attempt a focused fix when the failure is caused by your change
+- After a verification run succeeds (exit_code 0), prefer "finish" unless there is still failing work
 - Never commit, push, rewrite git history, or install global tools unless explicitly asked
 - Do not claim changes were made unless a patch or write action was actually approved and applied
 - Keep patches small and focused — one logical change at a time
+- Use blocker only when progress is unsafe or impossible; do not use blocker because a requested file has no unit test
 - If you do not have enough context, use "inspect" first
 
 JSON shape (use exactly one):
@@ -101,6 +108,9 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 	b.WriteString("- Use patch to create or modify files (unified diff format).\n")
 	b.WriteString("- Use write when you know the complete final content for one file and a unified diff is likely to fail.\n")
 	b.WriteString("- Use run for tests or build commands — Tessera will ask for approval first.\n")
+	b.WriteString("- If the user requested a specific edit or refactor, do not use finish until an edit has been applied.\n")
+	b.WriteString("- If any patch or write was applied, do not use finish until a relevant verification command has run after that change.\n")
+	b.WriteString("- Missing unit tests do not block editing; verify with the closest package test, project test, build, or type check.\n")
 	b.WriteString("- Use finish when the task is complete.\n")
 	b.WriteString("- Use blocker when you cannot proceed safely.\n")
 	b.WriteString("\n# Example responses\n")

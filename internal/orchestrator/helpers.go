@@ -39,3 +39,38 @@ func isSuccessfulPatchResult(result string) bool {
 func isSuccessfulWriteResult(result string) bool {
 	return strings.Contains(strings.ToLower(result), "write_status: applied")
 }
+
+func taskRequestsCodeChange(task string) bool {
+	words := tokenize(strings.ToLower(task))
+	for _, word := range []string{
+		"add", "alter", "alterar", "altere", "atualize", "change",
+		"corrija", "corrigir", "create", "criar", "crie", "edit", "editar",
+		"edite", "fix", "implement", "implementar", "implemente", "melhore",
+		"melhorar", "modifique", "modify", "mudar", "mude", "refactor",
+		"refactoring", "refatora", "refatorar", "refatore", "reformat",
+		"remove", "remova", "remover", "reescreva", "rewrite", "update",
+		"write",
+	} {
+		if words[word] {
+			return true
+		}
+	}
+	return false
+}
+
+func rejectedPrematureFinishResult(reason string) string {
+	return "finish_status: rejected\nreason: " + reason
+}
+
+func blockerOnlyMentionsMissingTests(reason string) bool {
+	lower := strings.ToLower(reason)
+	hasTestWord := strings.Contains(lower, "test") ||
+		strings.Contains(lower, "unit") ||
+		strings.Contains(lower, "teste")
+	hasMissingWord := strings.Contains(lower, "missing") ||
+		strings.Contains(lower, "no ") ||
+		strings.Contains(lower, "without") ||
+		strings.Contains(lower, "aus") ||
+		strings.Contains(lower, "sem ")
+	return hasTestWord && hasMissingWord
+}

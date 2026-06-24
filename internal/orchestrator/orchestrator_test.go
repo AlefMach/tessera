@@ -237,6 +237,7 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
 			{Text: `{"type":"patch","reason":"Create hello.txt.","files":["hello.txt"],"patch":` + strconv.Quote(patch) + `}`},
+			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
 			{Text: `{"type":"finish","summary":"Patch applied."}`},
 		},
 	}
@@ -254,8 +255,8 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(exec.commands) != 2 {
-		t.Fatalf("expected git status and one patch apply command, got %#v", exec.commands)
+	if len(exec.commands) != 3 {
+		t.Fatalf("expected git status, one patch apply command, and verification command, got %#v", exec.commands)
 	}
 	if got := exec.commands[0]; got.Name != "git" || strings.Join(got.Args, " ") != "status --short --branch" || got.Dir != root {
 		t.Fatalf("unexpected pre-patch git status command: %#v", got)
@@ -264,10 +265,13 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	if got.Name != "git" || len(got.Args) != 3 || got.Args[0] != "apply" || got.Dir != root {
 		t.Fatalf("unexpected patch command: %#v", got)
 	}
+	if got := exec.commands[2]; got.Name != "go" || strings.Join(got.Args, " ") != "test ./..." || got.Dir != root {
+		t.Fatalf("unexpected verification command: %#v", got)
+	}
 	if !ui.sawEvent("approval.requested") || !ui.sawEvent("patch.applied") {
 		t.Fatalf("expected patch approval and applied events, got %#v", ui.events)
 	}
-	if len(model.requests) != 2 {
+	if len(model.requests) != 3 {
 		t.Fatalf("expected Tessera to continue after applying patch, got %d LLM calls", len(model.requests))
 	}
 }
@@ -289,9 +293,11 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
 			{Text: `{"type":"write","reason":"Create hello.txt.","path":"hello.txt","content":"hello\n"}`},
+			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
 			{Text: `{"type":"finish","summary":"File written."}`},
 		},
 	}
+	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
 	ui := &scriptedUI{lines: []string{"escreva hello\n", "/exit\n"}}
 	cfg := config.Config{
 		Provider:   "ollama",
@@ -300,7 +306,7 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 		TesseraDir: t.TempDir(),
 	}
 
-	orch := New(model, store, ui, nil, cfg)
+	orch := New(model, store, ui, exec, cfg)
 	if err := orch.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -315,8 +321,95 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 	if !ui.sawEvent("approval.requested") || !ui.sawEvent("write.applied") {
 		t.Fatalf("expected write approval and applied events, got %#v", ui.events)
 	}
-	if len(model.requests) != 2 {
+	if len(model.requests) != 3 {
 		t.Fatalf("expected Tessera to continue after writing file, got %d LLM calls", len(model.requests))
+	}
+	if len(exec.commands) != 2 {
+		t.Fatalf("expected verification command after write, got %#v", exec.commands)
+	}
+	if got := exec.commands[1]; got.Name != "go" || strings.Join(got.Args, " ") != "test ./..." || got.Dir != root {
+		t.Fatalf("unexpected verification command after write: %#v", got)
+	}
+}
+
+func TestRequestedChangeRejectsFinishBeforeEdit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/reject-finish\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{
+		resps: []llm.GenerateResponse{
+			{Text: `{"type":"finish","summary":"Nothing to change."}`},
+			{Text: `{"type":"write","reason":"Apply the requested refactor.","path":"hello.txt","content":"hello\n"}`},
+			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
+			{Text: `{"type":"finish","summary":"Refactor applied and verified."}`},
+		},
+	}
+	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
+	ui := &scriptedUI{lines: []string{"refatore hello.txt\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, exec, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ui.sawEvent("model.finish.rejected") {
+		t.Fatalf("expected premature finish to be rejected, events=%#v", ui.events)
+	}
+	if _, err := os.Stat(filepath.Join(root, "hello.txt")); err != nil {
+		t.Fatalf("expected requested edit to be applied after rejected finish: %v", err)
+	}
+	if len(model.requests) != 4 {
+		t.Fatalf("expected model to continue after rejected finish, got %d calls", len(model.requests))
+	}
+}
+
+func TestMissingUnitTestBlockerDoesNotStopRequestedRefactor(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/reject-blocker\n")
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
+	model := &fakeLLM{
+		resps: []llm.GenerateResponse{
+			{Text: `{"type":"blocker","reason":"missing unit tests for the requested file"}`},
+			{Text: `{"type":"write","reason":"Apply the requested refactor.","path":"hello.txt","content":"hello\n"}`},
+			{Text: `{"type":"run","reason":"Verify with the closest package test.","command":"go test ./..."}`},
+			{Text: `{"type":"finish","summary":"Refactor applied and verified."}`},
+		},
+	}
+	exec := &fakeExecutor{out: port.Output{Stdout: "ok\n"}}
+	ui := &scriptedUI{lines: []string{"refatorar hello.txt\n", "/exit\n"}}
+	cfg := config.Config{Provider: "ollama", Model: "llama3.2", MaxTokens: 128, TesseraDir: t.TempDir()}
+
+	orch := New(model, store, ui, exec, cfg)
+	if err := orch.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ui.sawEvent("model.blocker.rejected") {
+		t.Fatalf("expected missing-test blocker to be rejected, events=%#v", ui.events)
+	}
+	if !ui.sawEvent("write.applied") || !ui.sawEvent("test.finished") {
+		t.Fatalf("expected edit and verification after rejected blocker, events=%#v", ui.events)
 	}
 }
 

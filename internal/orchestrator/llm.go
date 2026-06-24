@@ -22,6 +22,9 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 	previousResult := ""
 	successfulRunActions := 0
 	patchesAppliedSinceLastRun := false
+	changesApplied := false
+	verificationRunSinceLastChange := false
+	requiresCodeChange := taskRequestsCodeChange(input)
 
 	for step := 1; step <= maxAgentSteps; step++ {
 		run.Steps = step
@@ -38,6 +41,42 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 		action, err := o.requestModelAction(ctx, run, input, previousResult)
 		if err != nil {
 			return err
+		}
+
+		if action.Type == ActionFinish {
+			if requiresCodeChange && !changesApplied {
+				previousResult = rejectedPrematureFinishResult("the user asked for a code change or refactor, but no patch or write has been applied yet; inspect the relevant file if needed, then apply a focused edit")
+				o.saveObservation(ctx, run, "finish.rejected", previousResult, map[string]any{
+					"reason": "requested change without applied edit",
+				})
+				o.emit(ctx, event.New("model.finish.rejected", "Finish rejected", previousResult, map[string]any{
+					"run_id": run.ID,
+					"step":   step,
+				}))
+				continue
+			}
+			if changesApplied && !verificationRunSinceLastChange {
+				previousResult = rejectedPrematureFinishResult("a patch or write was applied, but no verification command has run after the latest change; run the narrowest relevant test, build, type check, or package verification command first")
+				o.saveObservation(ctx, run, "finish.rejected", previousResult, map[string]any{
+					"reason": "changed files without verification",
+				})
+				o.emit(ctx, event.New("model.finish.rejected", "Finish rejected", previousResult, map[string]any{
+					"run_id": run.ID,
+					"step":   step,
+				}))
+				continue
+			}
+		}
+		if action.Type == ActionBlocker && requiresCodeChange && !changesApplied && blockerOnlyMentionsMissingTests(action.Reason) {
+			previousResult = "blocker_status: rejected\nreason: missing unit tests are not a blocker for a requested code change or refactor; inspect the relevant file if needed, apply a focused edit, then verify with the closest available local check"
+			o.saveObservation(ctx, run, "blocker.rejected", previousResult, map[string]any{
+				"reason": action.Reason,
+			})
+			o.emit(ctx, event.New("model.blocker.rejected", "Blocker rejected", previousResult, map[string]any{
+				"run_id": run.ID,
+				"step":   step,
+			}))
+			continue
 		}
 
 		result, done, err := o.executeModelAction(ctx, run, action)
@@ -58,12 +97,15 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 		switch action.Type {
 		case ActionPatch, ActionWrite:
 			if isSuccessfulPatchResult(result) || isSuccessfulWriteResult(result) {
+				changesApplied = true
+				verificationRunSinceLastChange = false
 				patchesAppliedSinceLastRun = true
 				successfulRunActions = 0
 			}
 
 		case ActionRun:
 			if isSuccessfulRunResult(result) {
+				verificationRunSinceLastChange = true
 				successfulRunActions++
 
 				if successfulRunActions >= 2 && !patchesAppliedSinceLastRun {
