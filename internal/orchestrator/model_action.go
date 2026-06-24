@@ -222,14 +222,25 @@ func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action
 			"patch_file": patchPath,
 			"run_id":     runID(run),
 		}))
-		o.saveObservation(ctx, run, "patch.failed", output, map[string]any{
+		failureResult := strings.TrimSpace(fmt.Sprintf(
+			"patch_status: failed\nhint: unified diff headers must match actual file paths; use --- /dev/null for new files\n\n%s",
+			output,
+		))
+		o.saveObservation(ctx, run, "patch.failed", failureResult, map[string]any{
 			"patch_file": patchPath,
-			"hint":       "Check that the unified diff header paths match the actual file paths in the project.",
 		})
-		return output, false, nil
+		return failureResult, false, nil
 	}
 
-	result := firstNonEmpty(output, "patch applied")
+	filesChanged := strings.Join(action.Files, ", ")
+	if filesChanged == "" {
+		filesChanged = "unknown"
+	}
+	result := strings.TrimSpace(fmt.Sprintf(
+		"patch_status: applied\nfiles_changed: %s\n%s",
+		filesChanged,
+		output,
+	))
 	o.emit(ctx, event.New("patch.applied", "Patch applied", strings.TrimSpace(action.Reason), map[string]any{
 		"files":      action.Files,
 		"patch_file": patchPath,

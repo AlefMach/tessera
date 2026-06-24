@@ -11,7 +11,7 @@ import (
 	"github.com/alef-mach/tessera/internal/memory"
 )
 
-const maxAgentSteps = 40
+const maxAgentSteps = 400
 const maxActionParseAttempts = 2
 
 func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input string) error {
@@ -57,8 +57,10 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 
 		switch action.Type {
 		case ActionPatch:
-			patchesAppliedSinceLastRun = true
-			successfulRunActions = 0
+			if isSuccessfulPatchResult(result) {
+				patchesAppliedSinceLastRun = true
+				successfulRunActions = 0
+			}
 
 		case ActionRun:
 			if isSuccessfulRunResult(result) {

@@ -178,16 +178,19 @@ func (r *Renderer) renderApprovalRequested(evt event.Event) {
 	r.writeTitle("?", titleOr(evt, "Approval requested"), evt.Timestamp)
 	r.writeMarkdown(evt.Message)
 	r.writeKnownData(evt.Data, "risk", "reason", "cwd", "trust_store", "git_status")
+	if diff := dataString(evt.Data, "diff", "patch"); diff != "" {
+		r.writeBlock(renderDiff(diff, r.diffStyles))
+	}
+	if cmd := dataString(evt.Data, "command", "cmd"); cmd != "" {
+		r.writeBlock(r.styles.code.Render("$ " + cmd))
+	}
 	r.blank()
 }
 
 func (r *Renderer) renderPatchProposed(evt event.Event) {
 	r.writeTitle("±", titleOr(evt, "Patch proposed"), evt.Timestamp)
 	r.writeMarkdown(evt.Message)
-	r.writeKnownData(evt.Data, "files", "summary")
-	if diff := dataString(evt.Data, "diff", "patch"); diff != "" {
-		r.writeBlock(renderDiff(diff, r.diffStyles))
-	}
+	r.writeKnownData(evt.Data, "files", "summary", "git_status")
 	r.blank()
 }
 

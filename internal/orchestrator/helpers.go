@@ -31,3 +31,7 @@ func isSuccessfulRunResult(result string) bool {
 	return strings.Contains(lower, "status: ok") &&
 		strings.Contains(lower, "exit_code: 0")
 }
+
+func isSuccessfulPatchResult(result string) bool {
+	return strings.Contains(strings.ToLower(result), "patch_status: applied")
+}
