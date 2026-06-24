@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,29 +13,31 @@ import (
 
 const tesseraSystemPrompt = `You are Tessera, a local-first interactive coding agent.
 
-After a verification command succeeds with status ok and exit_code 0, prefer "finish" unless there is a specific remaining failing test, unapplied patch, or unresolved blocker. Do not run another test command just to be extra sure.
-Choose exactly one small next action at a time. Use the provided project context, git state, memory, and repo map.
-Do not claim you changed files unless an approved tool action actually changed them.
-Prefer narrow test commands before broad suites.
-Never ask to commit, push, discard changes, rewrite git history, or install global tools unless the user explicitly asks.
-Never ask for dangerous commands.
-Do not solve everything in one response. Do not write markdown.
+Your job is to help the user with coding tasks by taking ONE small action at a time.
+You MUST respond with ONLY valid JSON — no markdown, no explanation outside the JSON.
 
-Respond with only valid JSON using exactly one of these action types:
-{
-  "type": "inspect" | "patch" | "run" | "finish" | "blocker",
-  "reason": "why this is the right next small action",
-  "files": ["paths to inspect when type is inspect"],
-  "patch": "unified diff when type is patch",
-  "command": "local verification command when type is run",
-  "summary": "completion summary when type is finish"
-}
+Available action types:
+- "inspect": read specific files to understand the codebase before making changes
+- "patch": apply a unified diff to create or modify files
+- "run": execute a local verification command (tests, build, etc.)
+- "finish": mark the task as complete with a summary
+- "blocker": report when something prevents safe progress
 
-Use "inspect" when more file context is needed.
-Use "patch" only for small unified diffs.
-Use "run" for relevant local tests or verification commands.
-Use "finish" only when the task is actually complete.
-Use "blocker" when missing information, missing tools, or risk of overwriting user work prevents safe progress.`
+Rules:
+- Always inspect relevant files BEFORE writing patches — do not guess file content
+- When creating a new file, use patch with a unified diff (--- /dev/null header)
+- After a run succeeds (exit_code 0), prefer "finish" unless there is still failing work
+- Never commit, push, rewrite git history, or install global tools unless explicitly asked
+- Do not claim changes were made unless a patch action was actually approved and applied
+- Keep patches small and focused — one logical change at a time
+- If you do not have enough context, use "inspect" first
+
+JSON shape (use exactly one):
+{"type":"inspect","reason":"...","files":["path/to/file"]}
+{"type":"patch","reason":"...","patch":"--- a/file\n+++ b/file\n@@ ... @@\n..."}
+{"type":"run","reason":"...","command":"go test ./..."}
+{"type":"finish","summary":"..."}
+{"type":"blocker","reason":"..."}`
 
 func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousResult string) string {
 	profile, err := o.memory.GetProjectProfile(ctx, o.session.ID)
@@ -42,20 +46,21 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 	}
 
 	var b strings.Builder
-	b.WriteString("# User task\n")
+
+	b.WriteString("# Task\n")
 	b.WriteString(task)
 	b.WriteString("\n")
 
 	if strings.TrimSpace(previousResult) != "" {
-		b.WriteString("\n# Previous action result\n")
+		b.WriteString("\n# Result of previous action\n")
 		b.WriteString(previousResult)
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n# Project profile\n")
+	b.WriteString("\n# Project\n")
 	fmt.Fprintf(&b, "- root: %s\n", profile.Root)
-	fmt.Fprintf(&b, "- mode: %s\n", profile.Mode)
 	fmt.Fprintf(&b, "- stack: %s\n", profile.Stack)
+	fmt.Fprintf(&b, "- mode: %s\n", profile.Mode)
 	fmt.Fprintf(&b, "- manifests: %s\n", strings.Join(profile.Manifests, ", "))
 	fmt.Fprintf(&b, "- has_git: %t\n", profile.HasGit)
 	fmt.Fprintf(&b, "- has_tests: %t\n", profile.HasTests)
@@ -69,36 +74,142 @@ func (o *Orchestrator) buildPrompt(ctx context.Context, task string, previousRes
 	}
 
 	if memoryText := o.recentMemory(ctx, 8); memoryText != "" {
-		b.WriteString("\n# Recent local memory\n")
+		b.WriteString("\n# Recent actions\n")
 		b.WriteString(memoryText)
 		b.WriteString("\n")
 	}
 
-	if repoMap := o.repoMap(ctx, 60); repoMap != "" {
+	// Inline relevant file contents so a small local model can read and write code
+	if fileContext := o.relevantFileContext(ctx, task, previousResult); fileContext != "" {
+		b.WriteString("\n# Relevant file contents\n")
+		b.WriteString(fileContext)
+		b.WriteString("\n")
+	} else if repoMap := o.repoMap(ctx, 60); repoMap != "" {
+		// Fall back to repo map when no files can be inlined
 		b.WriteString("\n# Repo map\n")
 		b.WriteString(repoMap)
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n# Constraints\n")
-	b.WriteString("- Choose exactly one next small action, not a full solution.\n")
-	b.WriteString("- Respond only with valid JSON. Do not use markdown.\n")
-	b.WriteString("- Allowed actions are inspect, patch, run, finish, blocker.\n")
-	b.WriteString("- Prefer inspect when you do not have enough context.\n")
-	b.WriteString("- Prefer small patches. If proposing a file change, return a unified diff and do not assume it was applied.\n")
-	b.WriteString("- If running a command, use a single local project verification command; Tessera will ask the user for approval.\n")
-	b.WriteString("- Propose run actions for relevant tests or verification after changes.\n")
-	b.WriteString("- Use finish only when the task is actually complete.\n")
-	b.WriteString("- Use blocker when missing information, missing tools, or overwrite risk prevents safe progress.\n")
-	b.WriteString("- Never request dangerous commands, commits, pushes, destructive checkout/reset/clean, or global dependency installs unless explicitly requested.\n")
-	b.WriteString("- If existing user changes are present, mention that before proposing edits.\n")
-	b.WriteString("\n# Example response\n")
-	b.WriteString(`{"type":"inspect","reason":"I need to understand how the orchestrator calls the LLM today.","files":["internal/orchestrator/orchestrator.go","internal/orchestrator/llm.go"]}`)
+	b.WriteString("\n# Instructions\n")
+	b.WriteString("- Respond with ONLY valid JSON, no other text.\n")
+	b.WriteString("- Choose exactly ONE action type: inspect, patch, run, finish, or blocker.\n")
+	b.WriteString("- Use inspect when you need to read a file before editing it.\n")
+	b.WriteString("- Use patch to create or modify files (unified diff format).\n")
+	b.WriteString("- Use run for tests or build commands — Tessera will ask for approval first.\n")
+	b.WriteString("- Use finish when the task is complete.\n")
+	b.WriteString("- Use blocker when you cannot proceed safely.\n")
+	b.WriteString("\n# Example responses\n")
+	b.WriteString(`{"type":"inspect","reason":"Need to see the existing test structure before writing a new test.","files":["internal/sum/sum_test.go","internal/sum/sum.go"]}`)
 	b.WriteString("\n")
-	b.WriteString("- After a verification command succeeds with status ok and exit_code 0, prefer finish unless there is a specific remaining failing test, unapplied patch, or unresolved blocker.\n")
-	b.WriteString("- Do not run another test command just to be extra sure.\n")
+	b.WriteString(`{"type":"patch","reason":"Create the first unit test for sum.go.","patch":"--- /dev/null\n+++ b/internal/sum/sum_test.go\n@@ -0,0 +1,12 @@\n+package sum_test\n+\n+import (\n+\t\"testing\"\n+\t\"github.com/example/project/internal/sum\"\n+)\n+\n+func TestAdd(t *testing.T) {\n+\tif got := sum.Add(1, 2); got != 3 {\n+\t\tt.Errorf(\"Add(1,2) = %d, want 3\", got)\n+\t}\n+}"}`)
+	b.WriteString("\n")
+	b.WriteString(`{"type":"run","reason":"Run the tests to verify the new test file passes.","command":"go test ./..."}`)
+	b.WriteString("\n")
 
 	return truncateMiddle(b.String(), o.promptCharBudget())
+}
+
+// relevantFileContext reads and inlines the content of files most relevant to the current task.
+// It scores files based on keyword overlap with the task and previous result, then inlines the
+// top candidates so a small local model has actual code to read and edit.
+func (o *Orchestrator) relevantFileContext(ctx context.Context, task, previousResult string) string {
+	summaries, err := o.memory.ListFileSummaries(ctx, o.session.ID)
+	if err != nil || len(summaries) == 0 {
+		return ""
+	}
+
+	combined := strings.ToLower(task + " " + previousResult)
+	taskWords := tokenize(combined)
+
+	type scored struct {
+		path  string
+		score int
+	}
+	var candidates []scored
+	for _, s := range summaries {
+		score := scoreFile(s.Path, taskWords)
+		if score > 0 {
+			candidates = append(candidates, scored{path: s.Path, score: score})
+		}
+	}
+
+	// If no matches by keywords, fall back to test files and entry points for new-project tasks
+	if len(candidates) == 0 {
+		for _, s := range summaries {
+			base := strings.ToLower(filepath.Base(s.Path))
+			if strings.Contains(base, "_test") || strings.Contains(s.Path, "/test") {
+				candidates = append(candidates, scored{path: s.Path, score: 1})
+			}
+		}
+		// Also add small source files that look like entry points
+		for _, s := range summaries {
+			base := strings.ToLower(filepath.Base(s.Path))
+			if base == "main.go" || base == "main.ts" || base == "main.py" ||
+				base == "index.ts" || base == "index.js" || base == "app.py" {
+				candidates = append(candidates, scored{path: s.Path, score: 2})
+			}
+		}
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	budget := o.promptCharBudget() / 3 // use at most 1/3 of the char budget for file contents
+	var b strings.Builder
+	seen := map[string]bool{}
+
+	for _, c := range candidates {
+		if seen[c.path] {
+			continue
+		}
+		content, err := o.readWorkspaceFile(c.path)
+		if err != nil {
+			continue
+		}
+		block := fmt.Sprintf("## %s\n%s\n\n", c.path, content)
+		if b.Len()+len(block) > budget {
+			break
+		}
+		b.WriteString(block)
+		seen[c.path] = true
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+// scoreFile returns a relevance score for a file path given a set of task keywords.
+func scoreFile(path string, taskWords map[string]bool) int {
+	lowerPath := strings.ToLower(filepath.ToSlash(path))
+	parts := strings.FieldsFunc(lowerPath, func(r rune) bool {
+		return r == '/' || r == '_' || r == '-' || r == '.' || r == ' '
+	})
+	score := 0
+	for _, part := range parts {
+		if taskWords[part] {
+			score++
+		}
+	}
+	// boost test files when task mentions test/testing
+	if (taskWords["test"] || taskWords["tests"] || taskWords["testing"]) &&
+		(strings.Contains(lowerPath, "_test") || strings.Contains(lowerPath, "/test")) {
+		score += 2
+	}
+	return score
+}
+
+// tokenize splits text into a set of unique lowercase words (>2 chars).
+func tokenize(text string) map[string]bool {
+	words := map[string]bool{}
+	for _, word := range strings.FieldsFunc(text, func(r rune) bool {
+		return !('a' <= r && r <= 'z') && !('0' <= r && r <= '9')
+	}) {
+		if len(word) > 2 {
+			words[word] = true
+		}
+	}
+	return words
 }
 
 func (o *Orchestrator) gitStatus(ctx context.Context) string {
@@ -164,8 +275,6 @@ func (o *Orchestrator) promptCharBudget() int {
 	if o.config.ContextTokens <= 0 {
 		return 12000
 	}
-	// A conservative approximation keeps local-model prompts bounded without
-	// depending on provider-specific tokenizers.
 	return max(4000, o.config.ContextTokens*3)
 }
 
@@ -173,7 +282,7 @@ func appendInvalidActionRepairPrompt(prompt string, previousResponse string, pre
 	var b strings.Builder
 	b.WriteString(prompt)
 	b.WriteString("\n# Previous response was invalid\n")
-	b.WriteString("Your previous response was not valid Tessera action JSON. Return only valid JSON now.\n")
+	b.WriteString("Your previous response was not valid Tessera action JSON. Return ONLY valid JSON now.\n")
 	if previousErr != nil {
 		b.WriteString("Error: ")
 		b.WriteString(previousErr.Error())
@@ -184,7 +293,7 @@ func appendInvalidActionRepairPrompt(prompt string, previousResponse string, pre
 		b.WriteString(previousResponse)
 		b.WriteString("\n")
 	}
-	b.WriteString(`Expected shape: {"type":"inspect|patch|run|finish|blocker","reason":"...","files":["..."],"patch":"...","command":"...","summary":"..."}`)
+	b.WriteString(`Expected shape: {"type":"inspect|patch|run|finish|blocker","reason":"...","files":[...],"patch":"...","command":"...","summary":"..."}`)
 	b.WriteString("\n")
 	return b.String()
 }
@@ -208,3 +317,5 @@ func limitStrings(values []string, limit int) []string {
 	out = append(out, fmt.Sprintf("... %d more", len(values)-limit))
 	return out
 }
+
+

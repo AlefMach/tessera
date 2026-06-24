@@ -215,22 +215,16 @@ func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action
 	if err != nil {
 		return "", false, fmt.Errorf("save patch: %w", err)
 	}
-	out, err := o.executor.Run(ctx, port.Command{
-		Name:    "git",
-		Args:    []string{"apply", "--whitespace=nowarn", patchPath},
-		Dir:     o.session.CWD,
-		Timeout: 30 * time.Second,
-	})
-	output := commandOutput(out, err)
-	if err != nil || out.ExitCode != 0 {
+
+	output, applyErr := o.applyPatch(ctx, patchPath)
+	if applyErr != nil {
 		o.emit(ctx, event.New("run.aborted", "Patch failed", output, map[string]any{
 			"patch_file": patchPath,
-			"exit_code":  out.ExitCode,
 			"run_id":     runID(run),
 		}))
 		o.saveObservation(ctx, run, "patch.failed", output, map[string]any{
 			"patch_file": patchPath,
-			"exit_code":  out.ExitCode,
+			"hint":       "Check that the unified diff header paths match the actual file paths in the project.",
 		})
 		return output, false, nil
 	}
@@ -441,6 +435,39 @@ func commandRisk(command string) string {
 		}
 	}
 	return ""
+}
+
+// applyPatch tries to apply a patch file using git apply first, then falls back to GNU patch.
+// This allows Tessera to work in projects that are not git repositories.
+func (o *Orchestrator) applyPatch(ctx context.Context, patchPath string) (string, error) {
+	// Try git apply first (git repos and also works without --git on many versions)
+	out, err := o.executor.Run(ctx, port.Command{
+		Name:    "git",
+		Args:    []string{"apply", "--whitespace=nowarn", patchPath},
+		Dir:     o.session.CWD,
+		Timeout: 30 * time.Second,
+	})
+	output := commandOutput(out, err)
+	if err == nil && out.ExitCode == 0 {
+		return output, nil
+	}
+	gitErr := output
+
+	// Fall back to GNU patch for non-git repos or when git apply fails
+	out2, err2 := o.executor.Run(ctx, port.Command{
+		Name:    "patch",
+		Args:    []string{"-p1", "--forward", "--batch", "-i", patchPath},
+		Dir:     o.session.CWD,
+		Timeout: 30 * time.Second,
+	})
+	output2 := commandOutput(out2, err2)
+	if err2 == nil && out2.ExitCode == 0 {
+		return output2, nil
+	}
+
+	// Both failed — return combined diagnostics so the model can fix the patch
+	return fmt.Sprintf("git apply failed: %s\npatch fallback failed: %s", gitErr, output2),
+		fmt.Errorf("patch application failed")
 }
 
 func isDirtyGitStatus(status string) bool {
