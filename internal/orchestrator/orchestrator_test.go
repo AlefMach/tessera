@@ -413,6 +413,40 @@ func TestMissingUnitTestBlockerDoesNotStopRequestedRefactor(t *testing.T) {
 	}
 }
 
+func TestTaskRequestsCodeChangeRecognizesMultilingualEditIntent(t *testing.T) {
+	for _, task := range []string{
+		"refatore cmd/tessera/index.go",
+		"change internal/orchestrator/helpers.go",
+		"重构 cmd/tessera/index.go",
+		"修改 internal/orchestrator/helpers.go",
+		"рефакторинг cmd/tessera/index.go",
+		"modifica el archivo internal/orchestrator/helpers.go",
+	} {
+		if !taskRequestsCodeChange(task) {
+			t.Fatalf("expected task to request a code change: %q", task)
+		}
+	}
+}
+
+func TestTaskRequestsCodeChangeDoesNotTreatExplanationAsEdit(t *testing.T) {
+	for _, task := range []string{
+		"explique cmd/tessera/index.go",
+		"show me internal/orchestrator/helpers.go",
+		"what does this file do?",
+	} {
+		if taskRequestsCodeChange(task) {
+			t.Fatalf("expected task not to request a code change: %q", task)
+		}
+	}
+}
+
+func TestBlockerOnlyMentionsMissingTestsRejectsProvideTestContent(t *testing.T) {
+	reason := "The requested refactoring requires an existing test structure. Please provide the content of cmd/tessera/index_test.go before proceeding with any changes."
+	if !blockerOnlyMentionsMissingTests(reason) {
+		t.Fatalf("expected test-content blocker to be rejected")
+	}
+}
+
 func TestBlockerActionFailsRun(t *testing.T) {
 	ctx := context.Background()
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))

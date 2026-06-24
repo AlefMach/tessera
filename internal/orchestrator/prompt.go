@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/alef-mach/tessera/internal/port"
 )
@@ -219,7 +220,7 @@ func scoreFile(path string, taskWords map[string]bool) int {
 func tokenize(text string) map[string]bool {
 	words := map[string]bool{}
 	for _, word := range strings.FieldsFunc(text, func(r rune) bool {
-		return !('a' <= r && r <= 'z') && !('0' <= r && r <= '9')
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		if len(word) > 2 {
 			words[word] = true
