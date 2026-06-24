@@ -19,16 +19,22 @@ import (
 	"github.com/alef-mach/tessera/internal/session"
 )
 
+const intentNoChange = `{"requires_code_change":false,"task_type":"other"}`
+const intentCodeChange = `{"requires_code_change":true,"task_type":"refactor"}`
+
 func TestInteractiveInputCallsLLM(t *testing.T) {
 	ctx := context.Background()
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
-		resp: llm.GenerateResponse{
-			Text:         `{"type":"finish","summary":"resposta do modelo"}`,
-			Model:        "llama3.2",
-			InputTokens:  3,
-			OutputTokens: 4,
-			Duration:     12 * time.Millisecond,
+		resps: []llm.GenerateResponse{
+			{Text: intentNoChange},
+			{
+				Text:         `{"type":"finish","summary":"resposta do modelo"}`,
+				Model:        "llama3.2",
+				InputTokens:  3,
+				OutputTokens: 4,
+				Duration:     12 * time.Millisecond,
+			},
 		},
 	}
 	ui := &scriptedUI{lines: []string{"explique o projeto\n", "/exit\n"}}
@@ -44,10 +50,10 @@ func TestInteractiveInputCallsLLM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(model.requests) != 1 {
-		t.Fatalf("expected 1 LLM request, got %d", len(model.requests))
+	if len(model.requests) != 2 {
+		t.Fatalf("expected 2 LLM requests (intent + action), got %d", len(model.requests))
 	}
-	req := model.requests[0]
+	req := model.requests[1]
 	for _, want := range []string{"# User task\nexplique o projeto", "# Project profile", "# Constraints"} {
 		if !strings.Contains(req.Prompt, want) {
 			t.Fatalf("expected prompt to contain %q, got:\n%s", want, req.Prompt)
@@ -167,6 +173,7 @@ func TestIndexSlashCommandPersistsSymbols(t *testing.T) {
 func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/command\n")
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -180,6 +187,7 @@ func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
+			{Text: `{"requires_code_change":false,"task_type":"run_tests"}`},
 			{Text: `{"type":"run","reason":"Run the focused Go tests.","command":"go test ./..."}`},
 			{Text: `{"type":"finish","summary":"Tests passed. No code changes are needed."}`},
 		},
@@ -211,17 +219,18 @@ func TestRunCommandActionRequiresApprovalAndExecutes(t *testing.T) {
 	if !ui.sawEvent("test.finished") {
 		t.Fatalf("expected command result event, events=%#v", ui.events)
 	}
-	if len(model.requests) != 2 {
+	if len(model.requests) != 3 {
 		t.Fatalf("expected Tessera to continue after command output, got %d LLM calls", len(model.requests))
 	}
-	if !strings.Contains(model.requests[1].Prompt, "command.result") || !strings.Contains(model.requests[1].Prompt, "ok") {
-		t.Fatalf("expected second prompt to include command result, got:\n%s", model.requests[1].Prompt)
+	if !strings.Contains(model.requests[2].Prompt, "command.result") || !strings.Contains(model.requests[2].Prompt, "ok") {
+		t.Fatalf("expected third prompt to include command result, got:\n%s", model.requests[2].Prompt)
 	}
 }
 
 func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/patch\n")
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -236,6 +245,7 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	patch := "diff --git a/hello.txt b/hello.txt\nnew file mode 100644\nindex 0000000..ce01362\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hello\n"
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
+			{Text: intentCodeChange},
 			{Text: `{"type":"patch","reason":"Create hello.txt.","files":["hello.txt"],"patch":` + strconv.Quote(patch) + `}`},
 			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
 			{Text: `{"type":"finish","summary":"Patch applied."}`},
@@ -271,7 +281,7 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 	if !ui.sawEvent("approval.requested") || !ui.sawEvent("patch.applied") {
 		t.Fatalf("expected patch approval and applied events, got %#v", ui.events)
 	}
-	if len(model.requests) != 3 {
+	if len(model.requests) != 4 {
 		t.Fatalf("expected Tessera to continue after applying patch, got %d LLM calls", len(model.requests))
 	}
 }
@@ -279,6 +289,7 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/write\n")
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -292,6 +303,7 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
+			{Text: intentCodeChange},
 			{Text: `{"type":"write","reason":"Create hello.txt.","path":"hello.txt","content":"hello\n"}`},
 			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
 			{Text: `{"type":"finish","summary":"File written."}`},
@@ -321,7 +333,7 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 	if !ui.sawEvent("approval.requested") || !ui.sawEvent("write.applied") {
 		t.Fatalf("expected write approval and applied events, got %#v", ui.events)
 	}
-	if len(model.requests) != 3 {
+	if len(model.requests) != 4 {
 		t.Fatalf("expected Tessera to continue after writing file, got %d LLM calls", len(model.requests))
 	}
 	if len(exec.commands) != 2 {
@@ -335,6 +347,7 @@ func TestWriteActionRequiresApprovalWritesFileAndContinues(t *testing.T) {
 func TestRequestedChangeRejectsFinishBeforeEdit(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/reject-finish\n")
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -348,6 +361,7 @@ func TestRequestedChangeRejectsFinishBeforeEdit(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
+			{Text: intentCodeChange},
 			{Text: `{"type":"finish","summary":"Nothing to change."}`},
 			{Text: `{"type":"write","reason":"Apply the requested refactor.","path":"hello.txt","content":"hello\n"}`},
 			{Text: `{"type":"run","reason":"Verify the changed file.","command":"go test ./..."}`},
@@ -369,7 +383,7 @@ func TestRequestedChangeRejectsFinishBeforeEdit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "hello.txt")); err != nil {
 		t.Fatalf("expected requested edit to be applied after rejected finish: %v", err)
 	}
-	if len(model.requests) != 4 {
+	if len(model.requests) != 5 {
 		t.Fatalf("expected model to continue after rejected finish, got %d calls", len(model.requests))
 	}
 }
@@ -377,6 +391,7 @@ func TestRequestedChangeRejectsFinishBeforeEdit(t *testing.T) {
 func TestMissingUnitTestBlockerDoesNotStopRequestedRefactor(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/reject-blocker\n")
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -390,6 +405,7 @@ func TestMissingUnitTestBlockerDoesNotStopRequestedRefactor(t *testing.T) {
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{
 		resps: []llm.GenerateResponse{
+			{Text: intentCodeChange},
 			{Text: `{"type":"blocker","reason":"missing unit tests for the requested file"}`},
 			{Text: `{"type":"write","reason":"Apply the requested refactor.","path":"hello.txt","content":"hello\n"}`},
 			{Text: `{"type":"run","reason":"Verify with the closest package test.","command":"go test ./..."}`},
@@ -410,33 +426,6 @@ func TestMissingUnitTestBlockerDoesNotStopRequestedRefactor(t *testing.T) {
 	}
 	if !ui.sawEvent("write.applied") || !ui.sawEvent("test.finished") {
 		t.Fatalf("expected edit and verification after rejected blocker, events=%#v", ui.events)
-	}
-}
-
-func TestTaskRequestsCodeChangeRecognizesMultilingualEditIntent(t *testing.T) {
-	for _, task := range []string{
-		"refatore cmd/tessera/index.go",
-		"change internal/orchestrator/helpers.go",
-		"重构 cmd/tessera/index.go",
-		"修改 internal/orchestrator/helpers.go",
-		"рефакторинг cmd/tessera/index.go",
-		"modifica el archivo internal/orchestrator/helpers.go",
-	} {
-		if !taskRequestsCodeChange(task) {
-			t.Fatalf("expected task to request a code change: %q", task)
-		}
-	}
-}
-
-func TestTaskRequestsCodeChangeDoesNotTreatExplanationAsEdit(t *testing.T) {
-	for _, task := range []string{
-		"explique cmd/tessera/index.go",
-		"show me internal/orchestrator/helpers.go",
-		"what does this file do?",
-	} {
-		if taskRequestsCodeChange(task) {
-			t.Fatalf("expected task not to request a code change: %q", task)
-		}
 	}
 }
 
@@ -494,8 +483,9 @@ func TestAgentLoopStopsAtMaxSteps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(model.requests) != maxAgentSteps {
-		t.Fatalf("expected %d LLM calls, got %d", maxAgentSteps, len(model.requests))
+	// 1 intent call + maxAgentSteps action calls
+	if len(model.requests) != maxAgentSteps+1 {
+		t.Fatalf("expected %d LLM calls, got %d", maxAgentSteps+1, len(model.requests))
 	}
 	runs, err := store.ListRuns(ctx, model.requests[0].SessionID)
 	if err != nil {
@@ -534,6 +524,7 @@ func TestRunStepsUpdatedAcrossLoop(t *testing.T) {
 	ctx := context.Background()
 	store := sqlite.NewMemoryStore(filepath.Join(t.TempDir(), "memory.db"))
 	model := &fakeLLM{resps: []llm.GenerateResponse{
+		{Text: intentNoChange},
 		{Text: `{"type":"run","reason":"Verify.","command":"go test ./..."}`},
 		{Text: `{"type":"finish","summary":"done"}`},
 	}}

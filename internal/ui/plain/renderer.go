@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,20 +21,23 @@ import (
 type Renderer struct {
 	in         *bufio.Reader
 	out        io.Writer
+	width      int
 	styles     styles
 	diffStyles diffStyles
 	markdown   *glamour.TermRenderer
 }
 
 type styles struct {
-	title   lipgloss.Style
-	label   lipgloss.Style
-	muted   lipgloss.Style
-	success lipgloss.Style
-	warn    lipgloss.Style
-	err     lipgloss.Style
-	prompt  lipgloss.Style
-	code    lipgloss.Style
+	title    lipgloss.Style
+	label    lipgloss.Style
+	muted    lipgloss.Style
+	success  lipgloss.Style
+	warn     lipgloss.Style
+	err      lipgloss.Style
+	prompt   lipgloss.Style
+	code     lipgloss.Style
+	box      lipgloss.Style
+	boxLabel lipgloss.Style
 }
 
 func NewRenderer() *Renderer {
@@ -41,7 +45,7 @@ func NewRenderer() *Renderer {
 }
 
 func NewRendererWithIO(in io.Reader, out io.Writer) *Renderer {
-	width := 100
+	width := 80
 	if file, ok := out.(*os.File); ok {
 		if terminalWidth, _, err := term.GetSize(int(file.Fd())); err == nil && terminalWidth > 20 {
 			width = terminalWidth
@@ -56,6 +60,7 @@ func NewRendererWithIO(in io.Reader, out io.Writer) *Renderer {
 	return &Renderer{
 		in:         bufio.NewReader(in),
 		out:        out,
+		width:      width,
 		styles:     newStyles(),
 		diffStyles: newDiffStyles(),
 		markdown:   md,
@@ -63,15 +68,18 @@ func NewRendererWithIO(in io.Reader, out io.Writer) *Renderer {
 }
 
 func newStyles() styles {
+	accent := lipgloss.Color("81")
 	return styles{
-		title:   lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true),
-		label:   lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		muted:   lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
-		success: lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
-		warn:    lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true),
-		err:     lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
-		prompt:  lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true),
-		code:    lipgloss.NewStyle().Foreground(lipgloss.Color("229")),
+		title:    lipgloss.NewStyle().Foreground(accent).Bold(true),
+		label:    lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		muted:    lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		success:  lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
+		warn:     lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true),
+		err:      lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		prompt:   lipgloss.NewStyle().Foreground(accent).Bold(true),
+		code:     lipgloss.NewStyle().Foreground(lipgloss.Color("229")),
+		box:      lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1),
+		boxLabel: lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 	}
 }
 
@@ -87,14 +95,30 @@ func (r *Renderer) RenderEvent(evt event.Event) {
 		r.renderProjectProfiled(evt)
 	case "index.started", "index.finished":
 		r.renderSimple(evt)
-	case "llm.call.started", "llm.call.finished":
-		r.renderLLMCall(evt)
+	case "llm.call.started":
+		r.renderThinking()
+	case "llm.call.finished":
+		// silent — the action event that follows gives the feedback
+	case "agent.step.started", "agent.step.finished":
+		// silent — noisy with no user value
 	case "command.proposed":
 		r.renderCommandProposed(evt)
 	case "approval.requested", "workspace.trust.requested":
 		r.renderApprovalRequested(evt)
 	case "patch.proposed", "write.proposed":
 		r.renderPatchProposed(evt)
+	case "patch.applied":
+		r.renderChangeApplied(evt, "✓", "Patch applied", r.styles.success)
+	case "write.applied":
+		r.renderChangeApplied(evt, "✓", "Write applied", r.styles.success)
+	case "inspect.finished":
+		r.renderInspected(evt)
+	case "run.completed":
+		r.renderRunCompleted(evt)
+	case "run.failed":
+		r.renderRunFailed(evt)
+	case "model.finish.rejected", "model.blocker.rejected":
+		r.renderRetry(evt)
 	case "test.started", "test.finished":
 		r.renderTest(evt)
 	case "run.finished", "session.ended":
@@ -114,25 +138,38 @@ func (r *Renderer) ReadLine(prompt string) (string, error) {
 }
 
 func (r *Renderer) renderSession(evt event.Event) {
-	title := "Session started"
-	if normalizeEventType(evt.Type) == "session.resumed" {
-		title = "Session resumed"
-	}
-	if evt.Title != "" {
-		title = evt.Title
+	boxWidth := min(r.width-4, 60)
+
+	project := dataString(evt.Data, "cwd", "project")
+	if project != "" {
+		project = "~/" + filepath.Base(project)
 	}
 
-	r.writeTitle("◆", title, evt.Timestamp)
-	rows := []string{
-		kv("session", dataString(evt.Data, "session_id", "session")),
-		kv("model", modelLabel(evt.Data)),
-		kv("context", contextLabel(evt.Data)),
-		kv("calls", firstNonEmpty(dataString(evt.Data, "calls", "llm_calls"), "0")),
-		kv("cwd", dataString(evt.Data, "cwd", "project")),
+	lines := []string{
+		r.styles.title.Render("Tessera"),
+		r.styles.muted.Render("local-first coding agent"),
+		"",
+		row(r.styles.boxLabel, "Project", firstNonEmpty(project, ".")),
+		row(r.styles.boxLabel, "Model", modelLabel(evt.Data)),
+		row(r.styles.boxLabel, "Context", contextLabel(evt.Data)),
+		row(r.styles.boxLabel, "Memory", "local"),
 	}
-	r.writeRows(rows)
-	r.writeMarkdown(evt.Message)
+
+	gitStatus := dataString(evt.Data, "git_status", "git")
+	if gitStatus == "" {
+		gitStatus = "unknown"
+	}
+	lines = append(lines, row(r.styles.boxLabel, "Git", gitStatus))
+
+	content := strings.Join(lines, "\n")
+	box := r.styles.box.Width(boxWidth).Render(content)
+	fmt.Fprintln(r.out, box)
 	r.blank()
+
+	if msg := strings.TrimSpace(evt.Message); msg != "" {
+		r.writeMarkdown(msg)
+		r.blank()
+	}
 }
 
 func (r *Renderer) renderProjectProfiled(evt event.Event) {
@@ -151,17 +188,8 @@ func (r *Renderer) renderProjectProfiled(evt event.Event) {
 	r.blank()
 }
 
-func (r *Renderer) renderLLMCall(evt event.Event) {
-	r.writeTitle("◌", titleOr(evt, "LLM call"), evt.Timestamp)
-	rows := []string{
-		kv("model", modelLabel(evt.Data)),
-		kv("input", tokenLabel(evt.Data, "input_tokens", "prompt_tokens")),
-		kv("output", tokenLabel(evt.Data, "output_tokens", "completion_tokens")),
-		kv("duration", dataString(evt.Data, "duration", "elapsed")),
-	}
-	r.writeRows(rows)
-	r.writeMarkdown(evt.Message)
-	r.blank()
+func (r *Renderer) renderThinking() {
+	fmt.Fprintln(r.out, r.styles.muted.Render("  ⋯ thinking…"))
 }
 
 func (r *Renderer) renderCommandProposed(evt event.Event) {
@@ -195,6 +223,64 @@ func (r *Renderer) renderPatchProposed(evt event.Event) {
 		r.writeBlock(renderDiff(diff, r.diffStyles))
 	}
 	r.blank()
+}
+
+func (r *Renderer) renderChangeApplied(evt event.Event, mark, fallbackTitle string, style lipgloss.Style) {
+	title := titleOr(evt, fallbackTitle)
+	ts := evt.Timestamp.Local().Format("15:04:05")
+	files := dataString(evt.Data, "files", "file_changed")
+	suffix := ""
+	if files != "" {
+		suffix = r.styles.muted.Render("  " + files)
+	}
+	fmt.Fprintf(r.out, "%s %s %s%s\n",
+		style.Render(mark),
+		style.Render(title),
+		r.styles.muted.Render(ts),
+		suffix,
+	)
+	r.blank()
+}
+
+func (r *Renderer) renderInspected(evt event.Event) {
+	files := dataString(evt.Data, "files")
+	ts := evt.Timestamp.Local().Format("15:04:05")
+	label := "Inspected"
+	if files != "" {
+		label = "Inspected " + files
+	}
+	fmt.Fprintf(r.out, "%s %s\n",
+		r.styles.muted.Render("↳"),
+		r.styles.muted.Render(label+" "+ts),
+	)
+}
+
+func (r *Renderer) renderRunCompleted(evt event.Event) {
+	ts := evt.Timestamp.Local().Format("15:04:05")
+	fmt.Fprintf(r.out, "\n%s %s\n", r.styles.success.Render("✓ Done"), r.styles.muted.Render(ts))
+	if msg := strings.TrimSpace(evt.Message); msg != "" {
+		r.writeMarkdown(msg)
+	}
+	r.blank()
+}
+
+func (r *Renderer) renderRunFailed(evt event.Event) {
+	ts := evt.Timestamp.Local().Format("15:04:05")
+	fmt.Fprintf(r.out, "\n%s %s\n", r.styles.err.Render("✗ Failed"), r.styles.muted.Render(ts))
+	if msg := strings.TrimSpace(evt.Message); msg != "" {
+		r.writeMarkdown(msg)
+	}
+	if errMsg := dataString(evt.Data, "error"); errMsg != "" {
+		fmt.Fprintln(r.out, r.styles.err.Render("  "+errMsg))
+	}
+	r.blank()
+}
+
+func (r *Renderer) renderRetry(evt event.Event) {
+	fmt.Fprintf(r.out, "%s %s\n",
+		r.styles.warn.Render("↺"),
+		r.styles.muted.Render(strings.TrimSpace(evt.Message)),
+	)
 }
 
 func (r *Renderer) renderTest(evt event.Event) {
@@ -312,6 +398,13 @@ func (r *Renderer) blank() {
 	fmt.Fprintln(r.out)
 }
 
+func row(labelStyle lipgloss.Style, key, value string) string {
+	if value == "" {
+		return ""
+	}
+	return labelStyle.Render(fmt.Sprintf("%-10s", key+":")) + " " + value
+}
+
 func kv(key, value string) string {
 	if value == "" {
 		return ""
@@ -418,4 +511,11 @@ func eventSucceeded(data map[string]any) bool {
 
 func labelFor(key string) string {
 	return strings.ReplaceAll(key, "_", " ")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

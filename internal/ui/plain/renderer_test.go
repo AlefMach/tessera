@@ -31,7 +31,7 @@ func TestRenderSessionHeaderDoesNotClearScreen(t *testing.T) {
 	})
 
 	got := out.String()
-	for _, want := range []string{"Session started", "model:", "ollama/qwen", "context:", "4096 tokens", "calls:", "cwd:", "/repo"} {
+	for _, want := range []string{"Tessera", "Model:", "ollama/qwen", "Context:", "4096 tokens", "Project:", "/repo"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected output to contain %q, got:\n%s", want, got)
 		}

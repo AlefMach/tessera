@@ -24,7 +24,9 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 	patchesAppliedSinceLastRun := false
 	changesApplied := false
 	verificationRunSinceLastChange := false
-	requiresCodeChange := taskRequestsCodeChange(input)
+
+	intent := o.classifyTaskIntent(ctx, run, input)
+	requiresCodeChange := intent.RequiresCodeChange
 
 	for step := 1; step <= maxAgentSteps; step++ {
 		run.Steps = step
