@@ -176,24 +176,36 @@ func isSensitiveWorkspacePath(path string) bool {
 }
 
 func (o *Orchestrator) executePatch(ctx context.Context, run *memory.Run, action ModelAction) (string, bool, error) {
-	o.emit(ctx, event.New("patch.proposed", "Patch proposed", action.Reason, map[string]any{
-		"files":  action.Files,
-		"patch":  action.Patch,
-		"run_id": runID(run),
+	gitStatus := ""
+	if o.executor != nil {
+		gitStatus = o.gitStatus(ctx)
+	}
+	message := action.Reason
+	if isDirtyGitStatus(gitStatus) {
+		message = firstNonEmpty(message, "Review this patch before applying it.") + "\n\nWarning: the working tree already has changes. Review the diff carefully so user changes are not overwritten."
+	}
+
+	o.emit(ctx, event.New("patch.proposed", "Patch proposed", message, map[string]any{
+		"files":      action.Files,
+		"patch":      action.Patch,
+		"git_status": gitStatus,
+		"run_id":     runID(run),
 	}))
 	o.saveObservation(ctx, run, "patch.proposed", action.Reason, map[string]any{
-		"files": action.Files,
-		"patch": action.Patch,
+		"files":      action.Files,
+		"patch":      action.Patch,
+		"git_status": gitStatus,
 	})
 	if o.executor == nil {
 		return "", false, errors.New("patch unavailable: no command executor is configured")
 	}
 
-	approved := o.ui.AskApproval(event.New("approval.requested", "Apply patch?", action.Reason, map[string]any{
-		"files":  action.Files,
-		"patch":  action.Patch,
-		"risk":   "workspace file changes",
-		"run_id": runID(run),
+	approved := o.ui.AskApproval(event.New("approval.requested", "Apply patch?", message, map[string]any{
+		"files":      action.Files,
+		"patch":      action.Patch,
+		"git_status": gitStatus,
+		"risk":       "workspace file changes",
+		"run_id":     runID(run),
 	}))
 	if !approved {
 		return "patch denied by user", false, errors.New("patch denied by user")
@@ -354,7 +366,11 @@ func (o *Orchestrator) writePatchFile(run *memory.Run, patch string) (string, er
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "latest.patch")
+	filename := "latest.patch"
+	if runID(run) != "" {
+		filename = time.Now().UTC().Format("20060102-150405.000000000") + ".patch"
+	}
+	path := filepath.Join(dir, filename)
 	if !strings.HasSuffix(patch, "\n") {
 		patch += "\n"
 	}
@@ -425,4 +441,19 @@ func commandRisk(command string) string {
 		}
 	}
 	return ""
+}
+
+func isDirtyGitStatus(status string) bool {
+	status = strings.TrimSpace(status)
+	if status == "" || status == "clean" || strings.HasPrefix(status, "unavailable:") {
+		return false
+	}
+	for _, line := range strings.Split(status, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "##") {
+			continue
+		}
+		return true
+	}
+	return false
 }

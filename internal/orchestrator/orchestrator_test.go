@@ -254,10 +254,13 @@ func TestProposePatchRequiresApprovalAppliesAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(exec.commands) != 1 {
-		t.Fatalf("expected one patch apply command, got %#v", exec.commands)
+	if len(exec.commands) != 2 {
+		t.Fatalf("expected git status and one patch apply command, got %#v", exec.commands)
 	}
-	got := exec.commands[0]
+	if got := exec.commands[0]; got.Name != "git" || strings.Join(got.Args, " ") != "status --short --branch" || got.Dir != root {
+		t.Fatalf("unexpected pre-patch git status command: %#v", got)
+	}
+	got := exec.commands[1]
 	if got.Name != "git" || len(got.Args) != 3 || got.Args[0] != "apply" || got.Dir != root {
 		t.Fatalf("unexpected patch command: %#v", got)
 	}

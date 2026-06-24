@@ -35,3 +35,27 @@ func runInteractive(ctx context.Context, cfg config.Config) error {
 	orch := orchestrator.New(llm, memory, ui, executor, cfg)
 	return orch.Start(ctx)
 }
+func runTask(ctx context.Context, cfg config.Config, task string) error {
+	ui := plain.NewRenderer()
+
+	ok, err := ensureTrustedFolder(ui)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	memory := sqlite.NewMemoryStore(cfg.SQLitePath)
+
+	llm := ollama.NewOllamaLLM(
+		cfg.OllamaURL,
+		cfg.Model,
+		ollama.WithMemoryStore(memory),
+	)
+
+	executor := localexec.NewExecutor()
+
+	orch := orchestrator.New(llm, memory, ui, executor, cfg)
+	return orch.RunTask(ctx, task)
+}

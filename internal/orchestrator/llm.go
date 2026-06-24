@@ -41,21 +41,6 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, run *memory.Run, input 
 		}
 
 		result, done, err := o.executeModelAction(ctx, run, action)
-		if action.Type == ActionRun && isSuccessfulRunResult(result) {
-			successfulRunActions++
-			if successfulRunActions >= 2 {
-				summary := "Verification commands passed. Stopping to avoid repeating tests without new changes."
-				o.saveObservation(ctx, run, "finish.auto", summary, map[string]any{
-					"successful_run_actions": successfulRunActions,
-				})
-				o.emit(ctx, event.New("run.completed", "Run completed", summary, map[string]any{
-					"run_id": run.ID,
-				}))
-				return nil
-			}
-		} else if action.Type != ActionRun {
-			successfulRunActions = 0
-		}
 		if err != nil {
 			return err
 		}

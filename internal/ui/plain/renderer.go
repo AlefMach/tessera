@@ -177,7 +177,7 @@ func (r *Renderer) renderCommandProposed(evt event.Event) {
 func (r *Renderer) renderApprovalRequested(evt event.Event) {
 	r.writeTitle("?", titleOr(evt, "Approval requested"), evt.Timestamp)
 	r.writeMarkdown(evt.Message)
-	r.writeKnownData(evt.Data, "risk", "reason", "cwd", "trust_store")
+	r.writeKnownData(evt.Data, "risk", "reason", "cwd", "trust_store", "git_status")
 	r.blank()
 }
 

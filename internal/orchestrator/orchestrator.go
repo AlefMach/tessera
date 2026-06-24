@@ -32,6 +32,34 @@ func New(llm port.LLM, memory port.MemoryStore, ui port.UIRenderer, executor por
 }
 
 func (o *Orchestrator) Start(ctx context.Context) error {
+	if err := o.startSession(ctx, "Type your task or /help."); err != nil {
+		return err
+	}
+	return o.interactive(ctx)
+}
+
+func (o *Orchestrator) RunTask(ctx context.Context, input string) error {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return errors.New("task is required")
+	}
+	if err := o.startSession(ctx, "Running one task."); err != nil {
+		return err
+	}
+
+	run := o.startRun(ctx, input)
+	if run == nil {
+		return errors.New("run was not started")
+	}
+	if err := o.runAgentLoop(ctx, run, input); err != nil {
+		o.failRun(ctx, run, err)
+		return err
+	}
+	o.finishRun(ctx, run)
+	return nil
+}
+
+func (o *Orchestrator) startSession(ctx context.Context, message string) error {
 	if err := o.memory.Ensure(ctx); err != nil {
 		return err
 	}
@@ -42,7 +70,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	}
 	o.session = sess
 
-	o.emit(ctx, event.New("session.started", "Session started", "Type your task or /help.", map[string]any{
+	o.emit(ctx, event.New("session.started", "Session started", message, map[string]any{
 		"session_id":     o.session.ID,
 		"cwd":            o.session.CWD,
 		"provider":       o.config.Provider,
@@ -54,7 +82,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	o.profileProject(ctx)
 	o.indexProjectQuietly(ctx)
 
-	return o.interactive(ctx)
+	return nil
 }
 
 func (o *Orchestrator) interactive(ctx context.Context) error {
@@ -77,18 +105,12 @@ func (o *Orchestrator) interactive(ctx context.Context) error {
 		}
 		appendHistory(historyPath, input)
 
-		switch input {
-		case "/exit", "/quit":
+		switch {
+		case input == "/exit" || input == "/quit":
 			o.emit(ctx, event.New("session.ended", "Session ended", "", nil))
 			return nil
-		case "/help":
-			o.renderHelp(ctx)
-		case "/status":
-			o.renderStatus(ctx)
-		case "/memory":
-			o.renderMemory(ctx)
-		case "/index":
-			o.renderIndex(ctx)
+		case strings.HasPrefix(input, "/"):
+			o.handleSlashCommand(ctx, input)
 		default:
 			run := o.startRun(ctx, input)
 			if run == nil {
